@@ -50,7 +50,7 @@ import java.util.TimeZone;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicReference;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.plugin.common.MethodChannel;
@@ -81,6 +81,17 @@ public class ConversationHandler {
     private static final long CONVERSATION_SYNC_TIMEOUT_MS = 30_000L;
 
     /**
+     * Sync-failure callback used by {@link #runWhenConversationSynchronized}.
+     * Defined locally rather than using {@code java.util.function.Consumer} so
+     * the plugin's declared {@code minSdk=21} stays valid without core library
+     * desugaring ({@code Consumer} is API 24+).
+     */
+    @FunctionalInterface
+    private interface SyncErrorCallback {
+        void accept(String message);
+    }
+
+    /**
      * Wait until the conversation has synchronized its messages before running
      * {@code onReady}. Twilio's getMessages / getLastMessages / getMessageByIndex
      * throw {@code IllegalStateException("Synchronize the conversation first.")}
@@ -88,43 +99,50 @@ public class ConversationHandler {
      * {@link Conversation.SynchronizationStatus#ALL}.
      *
      * <p>{@code onFailed} is invoked exactly once with an error message on
-     * synchronization failure or after {@link #CONVERSATION_SYNC_TIMEOUT_MS}.
-     * Either {@code onReady} or {@code onFailed} is guaranteed to run, so
+     * synchronization failure, listener-registration failure, or after
+     * {@link #CONVERSATION_SYNC_TIMEOUT_MS}. {@code onFailed} is always
+     * dispatched on the main looper so callers can safely invoke
+     * MethodChannel.Result.success from inside it.
+     *
+     * <p>Either {@code onReady} or {@code onFailed} is guaranteed to run, so
      * callers can rely on it to complete their MethodChannel.Result.
      */
     private static void runWhenConversationSynchronized(
             Conversation conversation,
             Runnable onReady,
-            Consumer<String> onFailed) {
+            SyncErrorCallback onFailed) {
         final AtomicBoolean handled = new AtomicBoolean(false);
         final Handler mainHandler = new Handler(Looper.getMainLooper());
-        final ConversationListener[] listenerHolder = new ConversationListener[1];
-        final Runnable[] timeoutHolder = new Runnable[1];
+        final AtomicReference<ConversationListener> listenerHolder = new AtomicReference<>();
+        final AtomicReference<Runnable> timeoutHolder = new AtomicReference<>();
 
         // Post listener removal to the main looper so we never mutate Twilio's
-        // listener collection while it is iterating during dispatch (avoids
-        // ConcurrentModificationException on SDKs that don't snapshot listeners).
+        // listener collection while it is iterating during dispatch.
         final Runnable detachListener = () -> mainHandler.post(() -> {
             try {
-                ConversationListener l = listenerHolder[0];
+                ConversationListener l = listenerHolder.getAndSet(null);
                 if (l != null) {
-                    listenerHolder[0] = null;
                     conversation.removeListener(l);
                 }
-            } catch (Throwable ignored) {
-                // Conversation may already be destroyed; nothing to clean up.
+            } catch (RuntimeException e) {
+                System.err.println(
+                        "Conversation removeListener threw for " + conversation.getSid() + ": " + e);
             }
         });
 
         final Runnable cancelTimeout = () -> {
-            Runnable t = timeoutHolder[0];
+            Runnable t = timeoutHolder.getAndSet(null);
             if (t != null) {
-                timeoutHolder[0] = null;
                 mainHandler.removeCallbacks(t);
             }
         };
 
-        // Fast path: already terminal at entry.
+        // onFailed must run on the main looper because callers invoke
+        // MethodChannel.Result.success from inside it, which Flutter requires
+        // on the platform thread.
+        final SyncErrorCallback deliverFailed = msg -> mainHandler.post(() -> onFailed.accept(msg));
+
+        // Fast path: terminal at entry.
         Conversation.SynchronizationStatus status = conversation.getSynchronizationStatus();
         if (status == Conversation.SynchronizationStatus.ALL) {
             if (handled.compareAndSet(false, true)) {
@@ -134,12 +152,15 @@ public class ConversationHandler {
         }
         if (status == Conversation.SynchronizationStatus.FAILED) {
             if (handled.compareAndSet(false, true)) {
-                onFailed.accept("Conversation synchronization FAILED for " + conversation.getSid());
+                System.err.println(
+                        "Conversation synchronization already FAILED for " + conversation.getSid());
+                deliverFailed.accept(
+                        "Conversation synchronization FAILED for " + conversation.getSid());
             }
             return;
         }
 
-        listenerHolder[0] = new ConversationListener() {
+        listenerHolder.set(new ConversationListener() {
             @Override
             public void onSynchronizationChanged(Conversation conv) {
                 Conversation.SynchronizationStatus s = conv.getSynchronizationStatus();
@@ -153,7 +174,10 @@ public class ConversationHandler {
                     if (handled.compareAndSet(false, true)) {
                         cancelTimeout.run();
                         detachListener.run();
-                        onFailed.accept("Conversation synchronization FAILED for " + conv.getSid());
+                        System.err.println(
+                                "Conversation synchronization FAILED for " + conv.getSid());
+                        deliverFailed.accept(
+                                "Conversation synchronization FAILED for " + conv.getSid());
                     }
                 }
             }
@@ -189,16 +213,46 @@ public class ConversationHandler {
             @Override
             public void onTypingEnded(Conversation c, Participant p) {
             }
+        });
+
+        // Schedule the timeout BEFORE addListener so any synchronous initial
+        // dispatch from addListener can cancel it (Twilio's ConversationImpl
+        // fires onSynchronizationChanged with the current state on register).
+        // Also rescues the case where another caller invokes
+        // conversation.removeAllListeners() on us — the Future still resolves
+        // with a timeout error rather than hanging.
+        Runnable timeoutRunnable = () -> {
+            if (handled.compareAndSet(false, true)) {
+                detachListener.run();
+                System.err.println(
+                        "Conversation synchronization timed out for " + conversation.getSid());
+                deliverFailed.accept(
+                        "Conversation synchronization timed out for " + conversation.getSid());
+            }
         };
+        timeoutHolder.set(timeoutRunnable);
+        mainHandler.postDelayed(timeoutRunnable, CONVERSATION_SYNC_TIMEOUT_MS);
 
-        conversation.addListener(listenerHolder[0]);
+        try {
+            conversation.addListener(listenerHolder.get());
+        } catch (RuntimeException e) {
+            if (handled.compareAndSet(false, true)) {
+                cancelTimeout.run();
+                listenerHolder.set(null);
+                System.err.println(
+                        "Failed to register sync listener for " + conversation.getSid() + ": " + e);
+                deliverFailed.accept(
+                        "Failed to register sync listener: " + e.getMessage());
+            }
+            return;
+        }
 
-        // Re-check after attaching the listener — sync may have transitioned in
-        // the gap between the initial read and addListener, in which case the
-        // terminal event was dispatched before we were registered.
+        // Defensive recheck after attaching — covers SDK variants that don't
+        // dispatch the current state synchronously on register.
         Conversation.SynchronizationStatus recheck = conversation.getSynchronizationStatus();
         if (recheck == Conversation.SynchronizationStatus.ALL) {
             if (handled.compareAndSet(false, true)) {
+                cancelTimeout.run();
                 detachListener.run();
                 onReady.run();
             }
@@ -206,23 +260,14 @@ public class ConversationHandler {
         }
         if (recheck == Conversation.SynchronizationStatus.FAILED) {
             if (handled.compareAndSet(false, true)) {
+                cancelTimeout.run();
                 detachListener.run();
-                onFailed.accept("Conversation synchronization FAILED for " + conversation.getSid());
+                System.err.println(
+                        "Conversation synchronization FAILED for " + conversation.getSid());
+                deliverFailed.accept(
+                        "Conversation synchronization FAILED for " + conversation.getSid());
             }
-            return;
         }
-
-        // Timeout fallback. Also rescues the case where another caller removed
-        // our listener via Conversation.removeAllListeners (e.g. through
-        // unSubscribeToMessageUpdate) — the Future still resolves with a
-        // timeout error instead of hanging.
-        timeoutHolder[0] = () -> {
-            if (handled.compareAndSet(false, true)) {
-                detachListener.run();
-                onFailed.accept("Conversation synchronization timed out for " + conversation.getSid());
-            }
-        };
-        mainHandler.postDelayed(timeoutHolder[0], CONVERSATION_SYNC_TIMEOUT_MS);
     }
 
     /// Generate token and authenticate user #
@@ -1183,6 +1228,10 @@ public class ConversationHandler {
             @Override
             public void onError(ErrorInfo errorInfo) {
                 System.out.println("Error fetching conversation: " + errorInfo.getMessage());
+                Map<String, Object> messagesMap = new HashMap<>();
+                messagesMap.put("status", "failed");
+                list.add(messagesMap);
+                result.success(list);
             }
         });
     }
