@@ -139,8 +139,16 @@ public class ConversationHandler {
 
         // onFailed must run on the main looper because callers invoke
         // MethodChannel.Result.success from inside it, which Flutter requires
-        // on the platform thread.
-        final SyncErrorCallback deliverFailed = msg -> mainHandler.post(() -> onFailed.accept(msg));
+        // on the platform thread. Wrap in try/catch so a throwing onFailed
+        // (e.g. Result.success after the channel has already been replied to
+        // or torn down) does not propagate to Looper.loop() and crash the app.
+        final SyncErrorCallback deliverFailed = msg -> mainHandler.post(() -> {
+            try {
+                onFailed.accept(msg);
+            } catch (RuntimeException e) {
+                System.err.println("Sync onFailed handler threw for '" + msg + "': " + e);
+            }
+        });
 
         // Fast path: terminal at entry.
         Conversation.SynchronizationStatus status = conversation.getSynchronizationStatus();
@@ -267,6 +275,7 @@ public class ConversationHandler {
                 deliverFailed.accept(
                         "Conversation synchronization FAILED for " + conversation.getSid());
             }
+            return;
         }
     }
 
