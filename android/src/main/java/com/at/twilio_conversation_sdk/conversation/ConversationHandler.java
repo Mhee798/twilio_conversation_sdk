@@ -246,7 +246,11 @@ public class ConversationHandler {
         } catch (RuntimeException e) {
             if (handled.compareAndSet(false, true)) {
                 cancelTimeout.run();
-                listenerHolder.set(null);
+                // Use detachListener (not listenerHolder.set(null)) so that if Twilio
+                // had partially registered the listener before throwing, we attempt
+                // removeListener to clean up. detachListener tolerates a no-op /
+                // throwing remove via its own try/catch.
+                detachListener.run();
                 System.err.println(
                         "Failed to register sync listener for " + conversation.getSid() + ": " + e);
                 deliverFailed.accept(
@@ -649,9 +653,13 @@ public class ConversationHandler {
 
                             @Override
                             public void onError(ErrorInfo errorInfo) {
-                                Map<String, Object> errorResponse = new HashMap<>();
-                                errorResponse.put("error", "getLastMessages error: " + errorInfo.getMessage());
-                                result.success(errorResponse);
+                                // Mirror the success path's main-looper post so result.success is
+                                // always invoked on the platform thread (Flutter requirement).
+                                new Handler(Looper.getMainLooper()).post(() -> {
+                                    Map<String, Object> errorResponse = new HashMap<>();
+                                    errorResponse.put("error", "getLastMessages error: " + errorInfo.getMessage());
+                                    result.success(errorResponse);
+                                });
                             }
                         }),
                         errMsg -> {
@@ -694,13 +702,25 @@ public class ConversationHandler {
 
                                 if (foundMessage != null) {
                                     final Message targetMessage = foundMessage;
-                                    JSONObject jsonObject = new JSONObject(attribute);
-                                    final Attributes finalAttributes = new Attributes(jsonObject); // ✅ ต้องเป็น final
+                                    // attribute may be null when the caller only wants to update
+                                    // the body. Guard against new JSONObject(null) -> NPE and skip
+                                    // setAttributes entirely in that case (matches updateMessages).
+                                    final Attributes finalAttributes;
+                                    if (attribute != null) {
+                                        JSONObject jsonObject = new JSONObject(attribute);
+                                        finalAttributes = new Attributes(jsonObject);
+                                    } else {
+                                        finalAttributes = null;
+                                    }
 
                                     // ✅ อัปเดต body ก่อน
                                     targetMessage.updateBody(enteredMessage, new StatusListener() {
                                         @Override
                                         public void onSuccess() {
+                                            if (finalAttributes == null) {
+                                                result.success("Success");
+                                                return;
+                                            }
                                             // ✅ จากนั้นอัปเดต attributes ต่อ
                                             targetMessage.setAttributes(finalAttributes, new StatusListener() {
                                                 @Override
@@ -1188,6 +1208,18 @@ public class ConversationHandler {
                                             public void onSuccess(User user) {
                                                 conversationMap.put("friendlyIdentity", user.getIdentity());
                                                 conversationMap.put("friendlyName", user.getFriendlyName());
+                                                if (pendingCallbacks.decrementAndGet() == 0) {
+                                                    result.success(list);
+                                                }
+                                            }
+
+                                            @Override
+                                            public void onError(ErrorInfo errorInfo) {
+                                                // Without this override the default CallbackListener.onError
+                                                // just logs, pendingCallbacks never decrements, and the
+                                                // Flutter Future hangs forever.
+                                                System.err.println(
+                                                        "getAndSubscribeUser failed: " + errorInfo.getMessage());
                                                 if (pendingCallbacks.decrementAndGet() == 0) {
                                                     result.success(list);
                                                 }
