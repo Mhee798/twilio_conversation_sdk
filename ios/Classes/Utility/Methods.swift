@@ -28,5 +28,7 @@ class Methods {
     static let setTypingStatus: String = "setTypingStatus"
     static let isClientInitialized: String = "isClientInitialized"
     static let shutdownClient: String = "shutdownClient"
+    static let deleteConversation: String = "deleteConversation"
+    static let deleteMessageWithSid: String = "deleteMessageWithSid"
 
 }

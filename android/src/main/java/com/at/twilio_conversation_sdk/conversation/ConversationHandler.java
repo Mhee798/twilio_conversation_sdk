@@ -286,6 +286,12 @@ public class ConversationHandler {
     /// Generate token and authenticate user #
     public static String generateAccessToken(String accountSid, String apiKey, String apiSecret, String identity,
             String serviceSid, String pushSid) {
+        // Reject missing credentials early — apiSecret.getBytes() / Builder
+        // would otherwise NPE.
+        if (accountSid == null || apiKey == null || apiSecret == null) {
+            System.err.println("generateAccessToken: missing credential(s); aborting token build");
+            return "";
+        }
         // Create an AccessToken builder
         System.out.println("admin-" + Arrays.toString(apiSecret.getBytes()));
         AccessToken.Builder builder = new AccessToken.Builder(accountSid, apiKey, apiSecret.getBytes());
@@ -340,7 +346,7 @@ public class ConversationHandler {
             @Override
             public void onError(ErrorInfo errorInfo) {
                 StatusListener.super.onError(errorInfo);
-                result.success(Strings.fcmFail);
+                result.success(Strings.fcmUnFail);
             }
         });
     }
@@ -354,20 +360,43 @@ public class ConversationHandler {
 
         conversationClient.createConversation(conversationName, new CallbackListener<Conversation>() {
             @Override
-            public void onSuccess(Conversation conversations) {
+            public void onSuccess(Conversation conversation) {
+                // Previously called addParticipant(identity, conversationName, result)
+                // and then result.success(sid) — two bugs:
+                //   1. result.success fired twice (addParticipant calls it too).
+                //   2. addParticipant's 2nd arg is conversationId (sid), but
+                //      conversationName (friendly name) was passed, causing
+                //      its inner getConversation lookup to fail.
+                // Add the creator as a participant directly here and reply
+                // exactly once with the new sid.
+                final String sid = conversation.getSid();
+                conversation.addParticipantByIdentity(identity, null, new StatusListener() {
+                    @Override
+                    public void onSuccess() {
+                        result.success(sid);
+                    }
 
-                addParticipant(identity, conversationName, result);
-                result.success(conversations.getSid());
+                    @Override
+                    public void onError(ErrorInfo errorInfo) {
+                        StatusListener.super.onError(errorInfo);
+                        // Best-effort: conversation was created, return its
+                        // sid even if the participant add failed so callers
+                        // can retry the add separately.
+                        System.err.println("createConversation: addParticipant failed: " + errorInfo.getMessage());
+                        result.success(sid);
+                    }
+                });
             }
 
             @Override
             public void onError(ErrorInfo errorInfo) {
-                if (errorInfo.getMessage().equals(Strings.conversationExists)) {
+                CallbackListener.super.onError(errorInfo);
+                // Null-safe equals (was errorInfo.getMessage().equals(...) -> NPE).
+                if (Strings.conversationExists.equals(errorInfo.getMessage())) {
                     result.success(Strings.conversationExists);
                 } else {
                     result.success(Strings.createConversationFailure);
                 }
-                CallbackListener.super.onError(errorInfo);
             }
         });
     }
@@ -402,6 +431,7 @@ public class ConversationHandler {
             @Override
             public void onError(ErrorInfo errorInfo) {
                 CallbackListener.super.onError(errorInfo);
+                result.success(errorInfo.getMessage());
             }
         });
     }
@@ -438,6 +468,7 @@ public class ConversationHandler {
             @Override
             public void onError(ErrorInfo errorInfo) {
                 CallbackListener.super.onError(errorInfo);
+                result.success(errorInfo.getMessage());
             }
         });
     }
@@ -480,12 +511,16 @@ public class ConversationHandler {
             @Override
             public void onSuccess(Conversation conversation) {
                 // Join the conversation with the given participant identity
-                JSONObject jsonObject;
-                jsonObject = new JSONObject(attribute);
-
-                Attributes attributes = new Attributes(jsonObject);
-                conversation.prepareMessage().setAttributes(attributes).setBody(enteredMessage)
-                        .buildAndSend(new CallbackListener() {
+                // attribute may be null when the caller doesn't need to set
+                // attributes. Guard against new JSONObject(null) -> NPE and
+                // skip setAttributes entirely in that case (matches body()).
+                Conversation.MessageBuilder builder = conversation.prepareMessage().setBody(enteredMessage);
+                if (attribute != null) {
+                    JSONObject jsonObject = new JSONObject(attribute);
+                    Attributes attributes = new Attributes(jsonObject);
+                    builder.setAttributes(attributes);
+                }
+                builder.buildAndSend(new CallbackListener() {
                             @Override
                             public void onSuccess(Object data) {
                                 if (data instanceof Message) {
@@ -508,6 +543,7 @@ public class ConversationHandler {
             @Override
             public void onError(ErrorInfo errorInfo) {
                 CallbackListener.super.onError(errorInfo);
+                result.success(errorInfo.getMessage());
             }
         });
     }
@@ -681,6 +717,10 @@ public class ConversationHandler {
     /// Update message #
     public static void body(String enteredMessage, String conversationId, String msgId, HashMap attribute,
             MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
@@ -765,28 +805,52 @@ public class ConversationHandler {
     public static void sendMessageWithMedia(String enteredMessage, String conversationId, HashMap attribute,
             String mediaFilePath, String mimeType, String fileName, MethodChannel.Result result) {
         // Fetch the conversation using the conversationId
+        // Single-shot reply gate: ensures result.success fires exactly once
+        // across every async/sync path below — MediaUploadListener.onFailed,
+        // buildAndSend.onSuccess, buildAndSend.onError, the catch block, and
+        // the outer getConversation.onError (A4 + A5 fix). Previously the
+        // error branches only fired triggerEvent and the Dart Future hung.
+        final AtomicBoolean resultDelivered = new AtomicBoolean(false);
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
+                final AtomicBoolean mediaUploadFailed = new AtomicBoolean(false);
                 try {
                     System.out.println("enteredMessage:" + enteredMessage);
                     System.out.println("conversationId:" + conversationId);
                     System.out.println("MediaFile:" + mediaFilePath);
                     System.out.println("MediaType" + mimeType);
                     System.out.println("MediaName" + fileName);
-                    // Prepare the message with media
-                    JSONObject jsonObject;
-                    jsonObject = new JSONObject(attribute);
-
-                    Attributes attributes = new Attributes(jsonObject);
+                    // Prepare the message with media. `attribute` may be null
+                    // when the caller doesn't need to set attributes — skip
+                    // setAttributes in that case (matches body() / sendMessages).
+                    final Attributes attributes;
+                    if (attribute != null) {
+                        attributes = new Attributes(new JSONObject(attribute));
+                    } else {
+                        attributes = null;
+                    }
                     InputStream fileInputStream = null;
                     if (mediaFilePath != null) {
                         fileInputStream = openInputStream(new File(mediaFilePath));
                     }
-                    // try (InputStream inputStream = new FileInputStream(file)) {
-                    assert fileInputStream != null;
-                    conversation.prepareMessage().setAttributes(attributes).setBody(enteredMessage)
-                            .addMedia(fileInputStream, mimeType, fileName, new MediaUploadListener() {
+                    if (fileInputStream == null) {
+                        // Replaces release-build-stripped `assert`. Without a
+                        // media stream the SDK call would NPE / never resolve.
+                        System.err.println("sendMessageWithMedia: missing or unreadable media file: " + mediaFilePath);
+                        HashMap<String, Object> progressData = new HashMap<>();
+                        progressData.put("messageStatus", Strings.failed);
+                        triggerEvent(progressData);
+                        if (resultDelivered.compareAndSet(false, true)) {
+                            result.success(Strings.failed);
+                        }
+                        return;
+                    }
+                    Conversation.MessageBuilder builder = conversation.prepareMessage().setBody(enteredMessage);
+                    if (attributes != null) {
+                        builder.setAttributes(attributes);
+                    }
+                    builder.addMedia(fileInputStream, mimeType, fileName, new MediaUploadListener() {
                                 @Override
                                 public void onStarted() {
                                     System.out.println("Media onStarted:");
@@ -812,26 +876,46 @@ public class ConversationHandler {
                                 public void onFailed(@NonNull ErrorInfo errorInfo) {
                                     // Handle media upload failure
                                     System.err.println("Media upload failed:" + errorInfo.getMessage());
+                                    mediaUploadFailed.set(true);
                                     HashMap<String, Object> progressData = new HashMap<>();
                                     progressData.put("mediaStatus", Strings.failed);
                                     triggerEvent(progressData);
+                                    if (resultDelivered.compareAndSet(false, true)) {
+                                        result.success(Strings.failed);
+                                    }
                                 }
                             }).buildAndSend(new CallbackListener() {
                                 @Override
                                 public void onSuccess(Object data) {
-                                    // Message sent successfully
+                                    // buildAndSend completes after media is
+                                    // uploaded; if media upload failed earlier
+                                    // (onFailed already fired), don't report
+                                    // success.
                                     System.out.println("Message sent successfully!");
-                                    result.success("send");
+                                    if (mediaUploadFailed.get()) {
+                                        return;
+                                    }
+                                    String reply;
+                                    if (data instanceof Message) {
+                                        reply = ((Message) data).getSid();
+                                    } else {
+                                        reply = "send";
+                                    }
+                                    if (resultDelivered.compareAndSet(false, true)) {
+                                        result.success(reply);
+                                    }
                                 }
 
                                 @Override
                                 public void onError(ErrorInfo errorInfo) {
                                     // Handle message send error
                                     System.err.println("Error sending message: " + errorInfo.getMessage());
-                                    // result.success("SendMessageError", errorInfo.getMessage(), null);
                                     HashMap<String, Object> progressData = new HashMap<>();
                                     progressData.put("messageStatus", Strings.failed);
                                     triggerEvent(progressData);
+                                    if (resultDelivered.compareAndSet(false, true)) {
+                                        result.success(Strings.failed);
+                                    }
                                 }
                             });
                 } catch (Exception e) {
@@ -840,7 +924,9 @@ public class ConversationHandler {
                     HashMap<String, Object> progressData = new HashMap<>();
                     progressData.put("messageStatus", Strings.failed);
                     triggerEvent(progressData);
-                    // result.error("PrepareMessageError", e.getMessage(), null);
+                    if (resultDelivered.compareAndSet(false, true)) {
+                        result.success(Strings.failed);
+                    }
                 }
             }
 
@@ -848,10 +934,12 @@ public class ConversationHandler {
             public void onError(ErrorInfo errorInfo) {
                 // Handle error in fetching conversation
                 System.err.println("Error fetching conversation: " + errorInfo.getMessage());
-                // result.error("ConversationFetchError", errorInfo.getMessage(), null);
                 HashMap<String, Object> progressData = new HashMap<>();
                 progressData.put("messageStatus", Strings.failed);
                 triggerEvent(progressData);
+                if (resultDelivered.compareAndSet(false, true)) {
+                    result.success(Strings.failed);
+                }
             }
         });
     }
@@ -1299,6 +1387,16 @@ public class ConversationHandler {
 
                         result.success(list);
                     }
+
+                    @Override
+                    public void onError(ErrorInfo errorInfo) {
+                        CallbackListener.super.onError(errorInfo);
+                        System.out.println("Error fetching getUnreadMessagesCount: " + errorInfo.getMessage());
+                        Map<String, Object> errorMap = new HashMap<>();
+                        errorMap.put("status", Strings.failed);
+                        list.add(errorMap);
+                        result.success(list);
+                    }
                 });
             }
 
@@ -1468,7 +1566,7 @@ public class ConversationHandler {
         });
     }
 
-    public static void deleteMessage(String conversationId, int index, MethodChannel.Result result) {
+    public static void deleteMessage(String conversationId, long index, MethodChannel.Result result) {
         System.err.println("Index - " + index);
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
@@ -1514,6 +1612,78 @@ public class ConversationHandler {
             public void onError(ErrorInfo errorInfo) {
                 System.err.println("Failed to retrieve conversation. Error: " + errorInfo.getMessage());
                 result.success(Strings.failed);
+            }
+        });
+    }
+
+    /// Delete message by sid #
+    // Ported from ALAlliancetek fork (v0.4.0). Adapted to our fork:
+    //   - isClientInitialized guard added (matches every other public entry).
+    //   - getLastMessages call wrapped with runWhenConversationSynchronized
+    //     so it inherits PR #1's IllegalStateException protection — ALAT's
+    //     version called the SDK directly and would crash if the conversation
+    //     hadn't reached SynchronizationStatus.ALL yet.
+    //   - findMessageBySid helper inlined; replies use result.success(string)
+    //     instead of result.error(...) to match the rest of this fork (Dart
+    //     callers treat the response as a status string).
+    public static void deleteMessageWithSid(String conversationId, String messageSid, Integer messageCount,
+            MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
+        if (messageSid == null || messageSid.isEmpty()) {
+            result.success(Strings.failed + ": messageSid is required");
+            return;
+        }
+        final int searchCount = (messageCount != null && messageCount > 0) ? messageCount : 1000;
+        conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
+            @Override
+            public void onSuccess(Conversation conversation) {
+                runWhenConversationSynchronized(conversation,
+                        () -> conversation.getLastMessages(searchCount, new CallbackListener<List<Message>>() {
+                            @Override
+                            public void onSuccess(List<Message> messages) {
+                                Message found = null;
+                                if (messages != null) {
+                                    for (Message msg : messages) {
+                                        if (messageSid.equals(msg.getSid())) {
+                                            found = msg;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (found == null) {
+                                    result.success("msg_not_found: SID not in last " + searchCount + " messages");
+                                    return;
+                                }
+                                conversation.removeMessage(found, new StatusListener() {
+                                    @Override
+                                    public void onSuccess() {
+                                        result.success(Strings.success);
+                                    }
+
+                                    @Override
+                                    public void onError(ErrorInfo errorInfo) {
+                                        StatusListener.super.onError(errorInfo);
+                                        result.success("delete_failed: " + errorInfo.getMessage());
+                                    }
+                                });
+                            }
+
+                            @Override
+                            public void onError(ErrorInfo errorInfo) {
+                                CallbackListener.super.onError(errorInfo);
+                                result.success("getLastMessages error: " + errorInfo.getMessage());
+                            }
+                        }),
+                        errMsg -> result.success("Sync error: " + errMsg));
+            }
+
+            @Override
+            public void onError(ErrorInfo errorInfo) {
+                CallbackListener.super.onError(errorInfo);
+                result.success("conv_failed: " + errorInfo.getMessage());
             }
         });
     }

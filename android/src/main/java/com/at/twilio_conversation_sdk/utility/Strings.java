@@ -25,6 +25,7 @@ public class Strings {
     public final static String fcmSuccess = "FCM Registered Successful";
     public final static String fcmUnSuccess = "FCM UnRegistered Successful";
     public final static String fcmFail = "FCM Registered Fail";
+    public final static String fcmUnFail = "FCM UnRegistered Fail";
     public final static String failed = "Failed";
     public final static String success = "Success";
 

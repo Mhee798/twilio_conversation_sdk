@@ -329,6 +329,29 @@ class TwilioConversationSdk {
         .deleteMessage(conversationId: conversationId, index: index);
   }
 
+  /// Delete a single message identified by its SID.
+  ///
+  /// Looks up the message inside the last [messageCount] messages of the
+  /// conversation, then removes it. Useful when the caller has the
+  /// message SID but not its numeric index (e.g. from a chat-message
+  /// model bound to a server message id).
+  ///
+  /// Returns one of the status strings: `"success"`,
+  /// `"msg_not_found: ..."`, `"delete_failed: ..."`,
+  /// `"conv_failed: ..."`, `"getLastMessages error: ..."`, or
+  /// `"Sync error: ..."` (Android only — surfaces sync-wait timeout).
+  Future<String?> deleteMessageWithSid({
+    required String conversationId,
+    required String messageSid,
+    int messageCount = 100,
+  }) {
+    return TwilioConversationSdkPlatform.instance.deleteMessageWithSid(
+      conversationId: conversationId,
+      messageSid: messageSid,
+      messageCount: messageCount,
+    );
+  }
+
   /// Subscribes to message update events for a specific conversation.
   void subscribeToMessageUpdate({required String conversationSid}) async {
     TwilioConversationSdkPlatform.instance

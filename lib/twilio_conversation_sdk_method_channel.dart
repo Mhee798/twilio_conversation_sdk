@@ -272,6 +272,24 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
     return result;
   }
 
+  /// delete message by sid #
+  @override
+  Future<String?> deleteMessageWithSid({
+    required String conversationId,
+    required String messageSid,
+    required int messageCount,
+  }) async {
+    final result = await methodChannel.invokeMethod<String>(
+      'deleteMessageWithSid',
+      {
+        "conversationId": conversationId,
+        "messageSid": messageSid,
+        "messageCount": messageCount,
+      },
+    );
+    return result;
+  }
+
   @override
   Future<String?> setTypingStatus(
       {required String conversationId, required bool isTyping}) async {
