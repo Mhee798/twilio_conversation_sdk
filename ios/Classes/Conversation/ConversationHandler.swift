@@ -69,13 +69,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 return
             }
             guard let sid = conversation.sid else {
-                // No sid = nothing to key the waiter on. Match Android's
-                // short-circuit (deliver to onReady) — a sid-less conversation
-                // is typically a transient state right after creation, and
-                // failing the call here would intermittently break the first
-                // sendMessage right after createConversation. The SDK call
-                // inside onReady will surface its own error if the
-                // conversation truly isn't usable.
+                // No sid = nothing to key this waiter on. (Android's helper
+                // registers a listener directly on the Conversation object
+                // and doesn't need a sid, so it has no equivalent case;
+                // iOS's dispatch is sid-keyed so we have to short-circuit.)
+                // A sid-less conversation is typically a transient state
+                // right after createConversation, and failing here would
+                // intermittently break the first sendMessage after
+                // creation. Let the SDK call inside onReady surface its
+                // own error if the conversation truly isn't usable.
                 print("runWhenConversationSynchronized: conversation has no sid; running onReady without wait")
                 onReady()
                 return
@@ -1251,7 +1253,12 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     /// Fail every in-flight SyncWaiter with the given reason and clear the
     /// registry + any pending timers. Must run on .main.
-    fileprivate func drainSyncWaiters(reason: String) {
+    ///
+    /// We snapshot `syncWaiters` and clear it BEFORE iterating so that any
+    /// user onFailed closure that re-enters the handler (registers a new
+    /// sync-wait, calls shutdownClient again, etc.) operates against a clean
+    /// dict rather than corrupting the iteration we're inside.
+    private func drainSyncWaiters(reason: String) {
         let drain = { [weak self] in
             guard let self = self else { return }
             let pending = self.syncWaiters
