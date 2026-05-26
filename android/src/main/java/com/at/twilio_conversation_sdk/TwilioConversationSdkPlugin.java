@@ -8,6 +8,7 @@ import com.at.twilio_conversation_sdk.app_interface.ClientInterface;
 import com.at.twilio_conversation_sdk.app_interface.MessageInterface;
 import com.at.twilio_conversation_sdk.conversation.ConversationHandler;
 import com.at.twilio_conversation_sdk.utility.Methods;
+import com.at.twilio_conversation_sdk.utility.Strings;
 import com.twilio.conversations.Conversation;
 
 import java.util.List;
@@ -160,9 +161,18 @@ public class TwilioConversationSdkPlugin implements FlutterPlugin, MethodCallHan
             case Methods.deleteConversation:
                 ConversationHandler.deleteConversation(call.argument("conversationId"), result);
                 break;
-            case Methods.deleteMessage:
-                ConversationHandler.deleteMessage(call.argument("conversationId"), call.argument("index"), result);
+            case Methods.deleteMessage: {
+                // Dart `int` arrives as Integer for small values, Long for
+                // large ones — coerce via Number to avoid ClassCastException
+                // when the conversation has indexed past Integer.MAX_VALUE.
+                Number idx = call.argument("index");
+                if (idx == null) {
+                    result.success(Strings.failed);
+                    break;
+                }
+                ConversationHandler.deleteMessage(call.argument("conversationId"), idx.longValue(), result);
                 break;
+            }
             case Methods.setTypingStatus:
                 ConversationHandler.setTypingStatus(call.argument("conversationId"), call.argument("isTyping"), result);
                 break;
