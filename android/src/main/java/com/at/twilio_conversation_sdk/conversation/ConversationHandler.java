@@ -39,7 +39,6 @@ import java.io.InputStream;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -292,8 +291,8 @@ public class ConversationHandler {
             System.err.println("generateAccessToken: missing credential(s); aborting token build");
             return "";
         }
-        // Create an AccessToken builder
-        System.out.println("admin-" + Arrays.toString(apiSecret.getBytes()));
+        // Removed a debug System.out.println that dumped apiSecret bytes to
+        // logcat — those are trivially decodable back to the signing secret.
         AccessToken.Builder builder = new AccessToken.Builder(accountSid, apiKey, apiSecret.getBytes());
         // Set the identity of the token
         builder.identity(identity);
