@@ -70,7 +70,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             result(FlutterMethodNotImplemented)
             break
         case Methods.registerFCMToken:
-            guard let fcmToken = arguments?["fcmToken"] as? String else {
+            guard let fcmToken = arguments?["fcmToken"] as? String, !fcmToken.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "registerFCMToken requires fcmToken:String", details: nil))
                 break
             }
@@ -85,7 +85,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.unregisterFCMToken:
-            guard let fcmToken = arguments?["fcmToken"] as? String else {
+            guard let fcmToken = arguments?["fcmToken"] as? String, !fcmToken.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "unregisterFCMToken requires fcmToken:String", details: nil))
                 break
             }
@@ -100,7 +100,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.updateAccessToken:
-            guard let accessToken = arguments?["accessToken"] as? String else {
+            guard let accessToken = arguments?["accessToken"] as? String, !accessToken.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "updateAccessToken requires accessToken:String", details: nil))
                 break
             }
@@ -120,7 +120,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.initializeConversationClient:
-            guard let accessToken = arguments?["accessToken"] as? String else {
+            guard let accessToken = arguments?["accessToken"] as? String, !accessToken.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "initializeConversationClient requires accessToken:String", details: nil))
                 break
             }
@@ -138,7 +138,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.createConversation:
-            guard let conversationName = arguments?["conversationName"] as? String else {
+            guard let conversationName = arguments?["conversationName"] as? String, !conversationName.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "createConversation requires conversationName:String", details: nil))
                 break
             }
@@ -187,7 +187,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.getParticipants:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "getParticipants requires conversationId:String", details: nil))
                 break
             }
@@ -221,7 +221,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.getParticipantsWithName:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "getParticipantsWithName requires conversationId:String", details: nil))
                 break
             }
@@ -285,7 +285,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
  
         case Methods.addParticipant:
             guard let conversationId = arguments?["conversationId"] as? String,
-                  let participantName = arguments?["participantName"] as? String else {
+                  let participantName = arguments?["participantName"] as? String, !participantName.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "addParticipant requires conversationId:String, participantName:String", details: nil))
                 break
             }
@@ -303,7 +303,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             break
         case Methods.removeParticipant:
             guard let conversationId = arguments?["conversationId"] as? String,
-                  let participantName = arguments?["participantName"] as? String else {
+                  let participantName = arguments?["participantName"] as? String, !participantName.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "removeParticipant requires conversationId:String, participantName:String", details: nil))
                 break
             }
@@ -320,7 +320,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             break
         case Methods.joinConversation:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "joinConversation requires conversationId:String", details: nil))
                 break
             }
@@ -334,7 +334,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 }
             }
         case Methods.getMessages:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "getMessages requires conversationId:String", details: nil))
                 break
             }
@@ -346,14 +346,21 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                     result([])
                     return
                 }
-                self.conversationsHandler.conversationId = conversationId
+                // Previously: `self.conversationsHandler.conversationId = conversationId`.
+                // Removed — the field is the source-of-truth for the
+                // messageAdded auto-setLastReadMessageIndex gate (handler
+                // line 71), and assigning it here both (a) widened the
+                // race window to the full ~30s sync wait now wrapped
+                // around loadPreviousMessages and (b) duplicated
+                // subscribeToMessageUpdate's legitimate job. Callers that
+                // need the auto-read-mark must subscribe first.
                 self.conversationsHandler.loadPreviousMessages(conversationFromId, messageCount) { listOfMessages in
                     result(listOfMessages)
                 }
             }
             break
         case Methods.getLastMessages:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "getLastMessages requires conversationId:String", details: nil))
                 break
             }
@@ -370,7 +377,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             break
 
         case Methods.getUnReadMsgCount:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "getUnReadMsgCount requires conversationId:String", details: nil))
                 break
             }
@@ -388,30 +395,40 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             // Dart sometimes sends `null` for attribute when the caller has no
             // metadata — NSNull arrives, so `as? [String:Any]` is nil. Default
             // to empty dict instead of trapping.
-            let attribute = (arguments?["attribute"] as? [String: Any]) ?? [:]
-            self.conversationsHandler.sendMessage(conversationId: conversationId, messageText: message, attributes: attribute) { tchResult, tchMessages in
+            // Pass attribute through as Optional — handler skips setAttributes
+            // when nil to match Android (and to avoid overwriting existing
+            // message attributes with an empty {} blob on updateMessage).
+            let attribute = arguments?["attribute"] as? [String: Any]
+            self.conversationsHandler.sendMessage(conversationId: conversationId, messageText: message, attributes: attribute) { tchResult, tchMessages, failureReason in
                 if (tchResult.isSuccessful){
                     result(tchMessages ?? "")
                 }else {
+                    let msg = failureReason ?? tchResult.resultText ?? "Conversation not found"
                     result(FlutterError(code: "SEND_FAILED",
-                                        message: tchResult.resultText ?? "Conversation not found",
-                                        details: nil))
+                                        message: msg,
+                                        details: failureReason))
                 }
             }
             break
         case Methods.updateMessage:
             guard let conversationId = arguments?["conversationId"] as? String,
-                  let msgId = arguments?["msgId"] as? String,
+                  let msgId = arguments?["msgId"] as? String, !msgId.isEmpty,
                   let message = arguments?["message"] as? String else {
                 result(FlutterError(code: "INVALID_ARGS", message: "updateMessage requires conversationId:String, msgId:String, message:String", details: nil))
                 break
             }
-            let attribute = (arguments?["attribute"] as? [String: Any]) ?? [:]
-            self.conversationsHandler.body(conversationId: conversationId, msgId: msgId, messageText: message, attributes: attribute) { tchResult, tchMessages in
+            // Pass attribute through as Optional — handler skips setAttributes
+            // when nil to match Android (and to avoid overwriting existing
+            // message attributes with an empty {} blob on updateMessage).
+            let attribute = arguments?["attribute"] as? [String: Any]
+            self.conversationsHandler.body(conversationId: conversationId, msgId: msgId, messageText: message, attributes: attribute) { tchResult, tchMessages, failureReason in
                 if (tchResult.isSuccessful){
                     result("success")
                 }else {
-                    result(tchResult.resultText)
+                    // Surface the iOS-side reason rather than collapsing every
+                    // failure to nil — failureReason carries sync timeout /
+                    // msg_not_found / conv_failed diagnostics.
+                    result(failureReason ?? tchResult.resultText ?? "failed")
                 }
             }
             break
@@ -438,21 +455,25 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
         case Methods.sendMessageWithMedia:
             guard let conversationId = arguments?["conversationId"] as? String,
                   let message = arguments?["message"] as? String,
-                  let mediaFilePath = arguments?["mediaFilePath"] as? String,
-                  let mimeType = arguments?["mimeType"] as? String,
-                  let fileName = arguments?["fileName"] as? String else {
+                  let mediaFilePath = arguments?["mediaFilePath"] as? String, !mediaFilePath.isEmpty,
+                  let mimeType = arguments?["mimeType"] as? String, !mimeType.isEmpty,
+                  let fileName = arguments?["fileName"] as? String, !fileName.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS", message: "sendMessageWithMedia requires conversationId, message, mediaFilePath, mimeType, fileName all as String", details: nil))
                 break
             }
-            let attribute = (arguments?["attribute"] as? [String: Any]) ?? [:]
-            self.conversationsHandler.sendMessageWithMedia(conversationId: conversationId, messageText: message, attributes: attribute, mediaFilePath: mediaFilePath, mimeType: mimeType, fileName: fileName) { tchResult, tchMessages in
+            // Pass attribute through as Optional — handler skips setAttributes
+            // when nil to match Android (and to avoid overwriting existing
+            // message attributes with an empty {} blob on updateMessage).
+            let attribute = arguments?["attribute"] as? [String: Any]
+            self.conversationsHandler.sendMessageWithMedia(conversationId: conversationId, messageText: message, attributes: attribute, mediaFilePath: mediaFilePath, mimeType: mimeType, fileName: fileName) { tchResult, tchMessages, failureReason in
                 if (tchResult.isSuccessful){
                     print("sendMessageWithMedia send success")
                     result("send")
                 }else {
+                    let msg = failureReason ?? tchResult.resultText ?? "Conversation not found"
                     result(FlutterError(code: "SEND_FAILED",
-                                        message: tchResult.resultText ?? "Conversation not found",
-                                        details: nil))
+                                        message: msg,
+                                        details: failureReason))
                 }
             }
 
@@ -489,7 +510,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
 
             break
         case Methods.unSubscribeToMessageUpdate:
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS",
                                     message: "conversationId required",
                                     details: nil))
@@ -522,7 +543,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             // `as! String` which traps on missing/mistyped arguments;
             // PR #3 (I4) replaced that pattern with guard-let across
             // the file — apply the same here.
-            guard let conversationId = arguments?["conversationId"] as? String else {
+            guard let conversationId = arguments?["conversationId"] as? String, !conversationId.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS",
                                     message: "deleteConversation requires conversationId:String",
                                     details: nil))
@@ -534,7 +555,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             break
         case Methods.deleteMessageWithSid:
             guard let conversationId = arguments?["conversationId"] as? String,
-                  let messageSid = arguments?["messageSid"] as? String else {
+                  let messageSid = arguments?["messageSid"] as? String, !messageSid.isEmpty else {
                 result(FlutterError(code: "INVALID_ARGS",
                                     message: "deleteMessageWithSid requires conversationId:String, messageSid:String",
                                     details: nil))

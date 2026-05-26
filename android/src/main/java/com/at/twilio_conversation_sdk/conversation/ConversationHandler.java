@@ -285,9 +285,13 @@ public class ConversationHandler {
     /// Generate token and authenticate user #
     public static String generateAccessToken(String accountSid, String apiKey, String apiSecret, String identity,
             String serviceSid, String pushSid) {
-        // Reject missing credentials early — apiSecret.getBytes() / Builder
-        // would otherwise NPE.
-        if (accountSid == null || apiKey == null || apiSecret == null) {
+        // Reject missing credentials early — apiSecret.getBytes() / Builder /
+        // ChatGrant setters would otherwise NPE deeper in the JWT lib, where
+        // the exception escapes back through generateAccessToken and the
+        // Flutter handler thread, leaving MethodChannel.Result un-invoked
+        // and the Dart Future hanging forever.
+        if (accountSid == null || apiKey == null || apiSecret == null
+                || identity == null || serviceSid == null || pushSid == null) {
             System.err.println("generateAccessToken: missing credential(s); aborting token build");
             return "";
         }

@@ -27,9 +27,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     //
     // Both onReady and onFailed are guaranteed to fire exactly once on the
     // main queue. onFailed surfaces sync .failed, the 30-second timeout, or
-    // a missing sid. The timeout also acts as the Phase 5 watchdog for the
-    // affected paths — if the SDK's delegate callback never arrives, the
-    // wait still terminates rather than hanging the Dart Future forever.
+    // a missing sid.
+    //
+    // Scope of the watchdog: the 30s timeout only covers the sync-status
+    // step. Once onReady fires, the SDK calls that run inside it
+    // (getLastMessages, prepareMessage()...buildAndSend, getUnreadMessagesCount,
+    // updateBody, setAttributes, conversation.remove,
+    // media.getTemporaryContentUrl) are NOT individually watchdogged — if any
+    // of them never callback the Dart Future can still hang. Closing that
+    // remaining surface is Phase 5 watchdog work, not addressed here.
     private static let conversationSyncTimeoutSeconds: TimeInterval = 30
     private var syncWaiters: [String: [SyncWaiter]] = [:]
 
@@ -63,7 +69,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 return
             }
             guard let sid = conversation.sid else {
-                onFailed("Conversation has no sid; cannot wait for sync")
+                // No sid = nothing to key the waiter on. Match Android's
+                // short-circuit (deliver to onReady) — a sid-less conversation
+                // is typically a transient state right after creation, and
+                // failing the call here would intermittently break the first
+                // sendMessage right after createConversation. The SDK call
+                // inside onReady will surface its own error if the
+                // conversation truly isn't usable.
+                print("runWhenConversationSynchronized: conversation has no sid; running onReady without wait")
+                onReady()
                 return
             }
             let waiter = SyncWaiter(onReady: onReady, onFailed: onFailed)
@@ -77,15 +91,24 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                     self.removeWaiter(waiter, sid: sid)
                 }
             }
+            // Append BEFORE resume() so the dispatch path can never observe
+            // an empty list while a timer for an un-tracked waiter is alive.
+            self.syncWaiters[sid, default: []].append(waiter)
             waiter.timer = timer
             timer.resume()
-            self.syncWaiters[sid, default: []].append(waiter)
 
-            // Defensive recheck — status may have flipped to terminal in the
-            // gap between the fast-path check and the append above.
+            // Defensive recheck — status may have flipped to terminal in
+            // the gap between the fast-path check and the append above.
+            // Deferred via main.async so any onReady the recheck triggers
+            // runs on a fresh main-queue tick instead of synchronously
+            // inside this caller's stack frame (preserves the "onReady is
+            // async" contract that other call sites rely on, and prevents
+            // reentrant FlutterResult delivery during a switch handler).
             let recheck = conversation.synchronizationStatus
             if recheck == .all || recheck == .failed {
-                self.dispatchSyncWaiters(for: conversation)
+                DispatchQueue.main.async { [weak self] in
+                    self?.dispatchSyncWaiters(for: conversation)
+                }
             }
         }
         if Thread.isMainThread {
@@ -99,7 +122,13 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     /// now terminal. Called from the TwilioConversationsClient delegate
     /// callback for synchronization status updates. Safe to call on any
     /// status — non-terminal updates are no-ops.
+    ///
+    /// Must run on .main: syncWaiters and SyncWaiter.handled are written
+    /// from both this path and the main-queue helper / timer eventHandler,
+    /// and the dict / Bool are not thread-safe. dispatchPrecondition makes
+    /// the invariant explicit in debug builds.
     fileprivate func dispatchSyncWaiters(for conversation: TCHConversation) {
+        dispatchPrecondition(condition: .onQueue(.main))
         guard let sid = conversation.sid,
               let waiters = syncWaiters[sid],
               !waiters.isEmpty else { return }
@@ -317,11 +346,20 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     func conversationsClient(_ client: TwilioConversationsClient, conversation: TCHConversation, synchronizationStatusUpdated status: TCHConversationSynchronizationStatus) {
         // Wake any pending sync-wait registrations for this conversation
         // before forwarding the event so callers waiting on runWhen...
-        // unblock as early as possible.
-        dispatchSyncWaiters(for: conversation)
-        self.messageDelegate?.onSynchronizationChanged(status: ["status" : conversation.synchronizationStatus.rawValue])
-        print("StatusConversations \(conversation.synchronizationStatus.rawValue) ")
-
+        // unblock as early as possible. Funnel through main: Twilio iOS SDK
+        // does not contractually guarantee delegate dispatch queue and
+        // dispatchSyncWaiters mutates state shared with the main-queue
+        // helper / timer eventHandler.
+        let dispatch = { [weak self] in
+            self?.dispatchSyncWaiters(for: conversation)
+            self?.messageDelegate?.onSynchronizationChanged(status: ["status" : conversation.synchronizationStatus.rawValue])
+            print("StatusConversations \(conversation.synchronizationStatus.rawValue) ")
+        }
+        if Thread.isMainThread {
+            dispatch()
+        } else {
+            DispatchQueue.main.async(execute: dispatch)
+        }
     }
 
     func conversationsClientTokenWillExpire(_ client: TwilioConversationsClient) {
@@ -376,33 +414,44 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func sendMessage(conversationId: String,
                      messageText: String,
-                     attributes: [String: Any],
-                     completion: @escaping (TCHResult, String?) -> Void) {
-        // Fetch the conversation using the provided ID
+                     attributes: [String: Any]?,
+                     completion: @escaping (TCHResult, String?, String?) -> Void) {
+        // Third tuple slot `failureReason` surfaces the iOS-side error
+        // message (sync timeout, "Conversation not found", etc.) to the
+        // plugin handler. TCHResult is read-only, so its resultText cannot
+        // carry our diagnostic; without this channel a sync timeout would
+        // arrive at Dart as `FlutterError(SEND_FAILED, "Conversation not
+        // found")`, indistinguishable from a genuinely missing conversation.
         self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
             guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Conversation not found for id: \(conversationId)")
                 return
             }
 
             // Wait for sync — prepareMessage on an un-synced conversation can
             // produce a builder that buildAndSend rejects.
             self.runWhenConversationSynchronized(conversation, onReady: {
-                let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
-                conversation.prepareMessage()
-                    .setAttributes(attributesObject, error: nil)
-                    .setBody(messageText).buildAndSend(completion: { tchResult, tchMessages in
-                       if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
-                        completion(tchResult, messageSid)
-                        } else {
-                            completion(tchResult, nil)
-                        }
-                    })
+                let builder = conversation.prepareMessage().setBody(messageText)
+                if let attributes = attributes {
+                    var attrError: NSError?
+                    let attributesObject = TCHJsonAttributes(dictionary: attributes)
+                    _ = builder.setAttributes(attributesObject, error: &attrError)
+                    if let attrError = attrError {
+                        print("sendMessage: setAttributes rejected: \(attrError.localizedDescription)")
+                    }
+                }
+                builder.buildAndSend(completion: { tchResult, tchMessages in
+                    if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
+                        completion(tchResult, messageSid, nil)
+                    } else {
+                        completion(tchResult, nil, tchResult.resultText)
+                    }
+                })
             }, onFailed: { msg in
                 print("sendMessage: sync wait failed: \(msg)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Sync error: \(msg)")
             })
         }
     }
@@ -411,14 +460,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         conversationId: String,
         msgId: String,
         messageText: String,
-        attributes: [String: Any],
-        completion: @escaping (TCHResult, TCHMessage?) -> Void
+        attributes: [String: Any]?,
+        completion: @escaping (TCHResult, TCHMessage?, String?) -> Void
     ) {
+        // See sendMessage for the `failureReason` rationale.
         self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
             guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Conversation not found for id: \(conversationId)")
                 return
             }
             // Wait for sync before reading the message list — getLastMessages
@@ -426,29 +476,45 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             self.runWhenConversationSynchronized(conversation, onReady: {
                 conversation.getLastMessages(withCount: 1000) { result, messages in
                     guard result.isSuccessful, let messages = messages as? [TCHMessage] else {
-                        print("Failed to load messages: \(result.resultText ?? "Unknown error")")
-                        completion(result, nil)
+                        let err = result.resultText ?? "Unknown error"
+                        print("Failed to load messages: \(err)")
+                        completion(result, nil, "getLastMessages: \(err)")
                         return
                     }
                     guard let targetMessage = messages.first(where: { $0.sid == msgId }) else {
                         print("Message not found for sid: \(msgId)")
-                        completion(result, nil)
+                        // result.isSuccessful was true here — return a fresh
+                        // TCHResult() so plugin.updateMessage hits the error
+                        // branch instead of silently reporting "success".
+                        completion(TCHResult(), nil, "msg_not_found: \(msgId)")
                         return
                     }
-                    let attributesObject = TCHJsonAttributes(dictionary: attributes)
                     targetMessage.updateBody(messageText) { updateResult in
                         if updateResult.isSuccessful {
-                            targetMessage.setAttributes(attributesObject, completion: { attrResult in
-                                completion(attrResult, targetMessage)
-                            })
+                            // Skip setAttributes when the Dart caller didn't
+                            // supply attributes — matches Android's body()
+                            // logic and avoids overwriting existing message
+                            // attributes with an empty {} blob.
+                            if let attributes = attributes {
+                                let attributesObject = TCHJsonAttributes(dictionary: attributes)
+                                targetMessage.setAttributes(attributesObject, completion: { attrResult in
+                                    if attrResult.isSuccessful {
+                                        completion(attrResult, targetMessage, nil)
+                                    } else {
+                                        completion(attrResult, nil, attrResult.resultText ?? "setAttributes failed")
+                                    }
+                                })
+                            } else {
+                                completion(updateResult, targetMessage, nil)
+                            }
                         } else {
-                            completion(updateResult, nil)
+                            completion(updateResult, nil, updateResult.resultText ?? "updateBody failed")
                         }
                     }
                 }
             }, onFailed: { msg in
                 print("body(): sync wait failed: \(msg)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Sync error: \(msg)")
             })
         }
     }
@@ -553,7 +619,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             }
             }, onFailed: { msg in
                 print("updateMessages(): sync wait failed: \(msg)")
-                completion(["error": "Sync wait failed: \(msg)"])
+                completion(["error": "Sync error: \(msg)"])
             })
         }
     }
@@ -587,35 +653,51 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func sendMessageWithMedia(conversationId: String,
                               messageText: String,
-                              attributes: [String: Any],
+                              attributes: [String: Any]?,
                               mediaFilePath : String,
                               mimeType : String,
                               fileName :String ,
-                              completion: @escaping (TCHResult, TCHMessage?) -> Void) {
-        // Fetch the conversation using the provided ID
+                              completion: @escaping (TCHResult, TCHMessage?, String?) -> Void) {
+        // See sendMessage for the `failureReason` rationale.
         self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
             guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Conversation not found for id: \(conversationId)")
                 return
             }
 
-            // Open the input stream BEFORE waiting for sync — if the file is
-            // missing we can fail fast without holding the sync watcher open
-            // for 30 seconds.
-            guard let fileInputStream = InputStream(fileAtPath: mediaFilePath) else {
-                print("Error opening media file at path: \(mediaFilePath)")
-                completion(TCHResult(), nil)
+            // Check file existence/readability BEFORE waiting for sync so a
+            // missing/unreadable file fails immediately instead of being
+            // parked behind the 30s sync watcher.
+            // (`InputStream(fileAtPath:)` itself only allocates the stream
+            // and does not detect missing files — the underlying open
+            // happens lazily during upload, so the check above is what
+            // actually catches the fail-fast case.)
+            guard FileManager.default.isReadableFile(atPath: mediaFilePath) else {
+                print("Media file not readable at path: \(mediaFilePath)")
+                completion(TCHResult(), nil, "Media file not readable at path: \(mediaFilePath)")
                 return
             }
 
             self.runWhenConversationSynchronized(conversation, onReady: {
-                let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
-                conversation.prepareMessage()
-                    .setAttributes(attributesObject, error: nil)
-                    .setBody(messageText)
-                    .addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
+                // Open the stream lazily inside onReady so we don't hold the
+                // stream object alive across the 30s sync wait window.
+                guard let fileInputStream = InputStream(fileAtPath: mediaFilePath) else {
+                    print("Error opening media file at path: \(mediaFilePath)")
+                    completion(TCHResult(), nil, "Error opening media file at path: \(mediaFilePath)")
+                    return
+                }
+                let builder = conversation.prepareMessage().setBody(messageText)
+                if let attributes = attributes {
+                    var attrError: NSError?
+                    let attributesObject = TCHJsonAttributes(dictionary: attributes)
+                    _ = builder.setAttributes(attributesObject, error: &attrError)
+                    if let attrError = attrError {
+                        print("sendMessageWithMedia: setAttributes rejected: \(attrError.localizedDescription)")
+                    }
+                }
+                builder.addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
                         onStarted: {
                             print("Media upload started.")
                         },
@@ -630,11 +712,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                         }
                     ))
                     .buildAndSend(completion: { tchResult, tchMessages in
-                        completion(tchResult, tchMessages)
+                        if tchResult.isSuccessful {
+                            completion(tchResult, tchMessages, nil)
+                        } else {
+                            completion(tchResult, tchMessages, tchResult.resultText)
+                        }
                     })
             }, onFailed: { msg in
                 print("sendMessageWithMedia: sync wait failed: \(msg)")
-                completion(TCHResult(), nil)
+                completion(TCHResult(), nil, "Sync error: \(msg)")
             })
         }
     }
@@ -1059,7 +1145,11 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             completion(Strings.clientNotInitialized)
             return
         }
-        getConversationFromId(conversationId: conversationId) { conversation in
+        getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard self != nil else {
+                completion("conv_failed: handler released")
+                return
+            }
             guard let conversation = conversation else {
                 completion("conv_failed: Conversation not found")
                 return
@@ -1132,6 +1222,14 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     }
 
     func shutdownClient(completion: @escaping (String) -> Void) {
+        // Always drain pending sync-wait registrations BEFORE nilling the
+        // client — even on the "already shutdown" branch — so any in-flight
+        // Dart Future resolves now (with a defined error) instead of waiting
+        // up to 30 s for its timer to fire after the channel has been torn
+        // down (which would surface as 'Reply already submitted' or a stale
+        // completion on a dead FlutterResult).
+        drainSyncWaiters(reason: "client shutdown")
+
         if let client = self.client {
             // Shutdown the client
             client.shutdown()
@@ -1148,6 +1246,26 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             completion("Client shutdown successfully")
         } else {
             completion("Client already shutdown or not initialized")
+        }
+    }
+
+    /// Fail every in-flight SyncWaiter with the given reason and clear the
+    /// registry + any pending timers. Must run on .main.
+    fileprivate func drainSyncWaiters(reason: String) {
+        let drain = { [weak self] in
+            guard let self = self else { return }
+            let pending = self.syncWaiters
+            self.syncWaiters.removeAll()
+            for waiters in pending.values {
+                for waiter in waiters {
+                    _ = waiter.fireFailed(reason)
+                }
+            }
+        }
+        if Thread.isMainThread {
+            drain()
+        } else {
+            DispatchQueue.main.async(execute: drain)
         }
     }
 }
