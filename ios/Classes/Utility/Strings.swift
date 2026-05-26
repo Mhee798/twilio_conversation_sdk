@@ -31,4 +31,7 @@ class Strings {
     
     /// Used when twilio access token is refreshed
     static let accessTokenRefreshed: String = "Access token refreshed"
+
+    /// Used when conversations client is not initialized yet (cold start / pre-sync)
+    static let clientNotInitialized: String = "Client not initialized"
 }
