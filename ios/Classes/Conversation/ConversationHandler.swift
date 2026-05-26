@@ -17,14 +17,117 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     public var messageSubscriptionId: String = ""
     var tokenEventSink: FlutterEventSink?
 
-    // MARK: Client Initialization Check
-    /// Check if the client is initialized and ready to use
-    /// - Returns: true if client is initialized and synchronized, false otherwise
+    // MARK: Sync-wait helper (I2 — Swift port of Android's
+    // runWhenConversationSynchronized). Wait until a TCHConversation reaches
+    // .all synchronization status before invoking a closure that calls into
+    // Twilio's message APIs. Without this guard, getLastMessages /
+    // prepareMessage / setLastReadMessageIndex etc. invoked too early would
+    // either no-op silently or return empty data, and the caller's Future
+    // would never resolve.
+    //
+    // Both onReady and onFailed are guaranteed to fire exactly once on the
+    // main queue. onFailed surfaces sync .failed, the 30-second timeout, or
+    // a missing sid. The timeout also acts as the Phase 5 watchdog for the
+    // affected paths — if the SDK's delegate callback never arrives, the
+    // wait still terminates rather than hanging the Dart Future forever.
+    private static let conversationSyncTimeoutSeconds: TimeInterval = 30
+    private var syncWaiters: [String: [SyncWaiter]] = [:]
+
     func isClientInitialized() -> Bool {
         guard let client = client else {
             return false
         }
         return client.synchronizationStatus == .completed
+    }
+
+    /// Run `onReady` once the conversation reports
+    /// `TCHConversationSynchronizationStatus.all`. On `.failed`, a missing
+    /// sid, or a 30-second timeout, run `onFailed` instead. Exactly one of
+    /// the two runs, always on the main queue.
+    func runWhenConversationSynchronized(
+        _ conversation: TCHConversation,
+        onReady: @escaping () -> Void,
+        onFailed: @escaping (String) -> Void
+    ) {
+        let body = { [weak self] in
+            guard let self = self else { return }
+            let status = conversation.synchronizationStatus
+            if status == .all {
+                onReady()
+                return
+            }
+            if status == .failed {
+                let sidStr = conversation.sid ?? "?"
+                print("Conversation synchronization already FAILED for \(sidStr)")
+                onFailed("Conversation synchronization FAILED for \(sidStr)")
+                return
+            }
+            guard let sid = conversation.sid else {
+                onFailed("Conversation has no sid; cannot wait for sync")
+                return
+            }
+            let waiter = SyncWaiter(onReady: onReady, onFailed: onFailed)
+            // Schedule the timeout BEFORE registering — defends against the
+            // SDK never firing the delegate callback (Phase 5 watchdog).
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + ConversationsHandler.conversationSyncTimeoutSeconds)
+            timer.setEventHandler { [weak self, weak waiter] in
+                guard let self = self, let waiter = waiter else { return }
+                if waiter.fireFailed("Conversation synchronization timed out for \(sid)") {
+                    self.removeWaiter(waiter, sid: sid)
+                }
+            }
+            waiter.timer = timer
+            timer.resume()
+            self.syncWaiters[sid, default: []].append(waiter)
+
+            // Defensive recheck — status may have flipped to terminal in the
+            // gap between the fast-path check and the append above.
+            let recheck = conversation.synchronizationStatus
+            if recheck == .all || recheck == .failed {
+                self.dispatchSyncWaiters(for: conversation)
+            }
+        }
+        if Thread.isMainThread {
+            body()
+        } else {
+            DispatchQueue.main.async(execute: body)
+        }
+    }
+
+    /// Wake any waiters registered for this conversation if its sync status is
+    /// now terminal. Called from the TwilioConversationsClient delegate
+    /// callback for synchronization status updates. Safe to call on any
+    /// status — non-terminal updates are no-ops.
+    fileprivate func dispatchSyncWaiters(for conversation: TCHConversation) {
+        guard let sid = conversation.sid,
+              let waiters = syncWaiters[sid],
+              !waiters.isEmpty else { return }
+        switch conversation.synchronizationStatus {
+        case .all:
+            syncWaiters.removeValue(forKey: sid)
+            for waiter in waiters {
+                _ = waiter.fireReady()
+            }
+        case .failed:
+            syncWaiters.removeValue(forKey: sid)
+            for waiter in waiters {
+                _ = waiter.fireFailed("Conversation synchronization FAILED for \(sid)")
+            }
+        default:
+            // Not yet terminal — keep waiting.
+            break
+        }
+    }
+
+    private func removeWaiter(_ waiter: SyncWaiter, sid: String) {
+        guard var list = syncWaiters[sid] else { return }
+        list.removeAll { $0 === waiter }
+        if list.isEmpty {
+            syncWaiters.removeValue(forKey: sid)
+        } else {
+            syncWaiters[sid] = list
+        }
     }
 
 
@@ -212,6 +315,10 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
 
     func conversationsClient(_ client: TwilioConversationsClient, conversation: TCHConversation, synchronizationStatusUpdated status: TCHConversationSynchronizationStatus) {
+        // Wake any pending sync-wait registrations for this conversation
+        // before forwarding the event so callers waiting on runWhen...
+        // unblock as early as possible.
+        dispatchSyncWaiters(for: conversation)
         self.messageDelegate?.onSynchronizationChanged(status: ["status" : conversation.synchronizationStatus.rawValue])
         print("StatusConversations \(conversation.synchronizationStatus.rawValue) ")
 
@@ -272,30 +379,31 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                      attributes: [String: Any],
                      completion: @escaping (TCHResult, String?) -> Void) {
         // Fetch the conversation using the provided ID
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
                 completion(TCHResult(), nil)
                 return
             }
 
-            // Convert attributes dictionary into Attributes type
-            let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
-
-            // Prepare and send the message
-            conversation.prepareMessage()
-                .setAttributes(attributesObject, error: nil)
-                .setBody(messageText).buildAndSend(completion: { tchResult, tchMessages in
-                   if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
-                    // ✅ สำเร็จ — ส่งกลับ message SID
-                    completion(tchResult, messageSid)
-                    } else {
-                        // ❌ ล้มเหลว — ส่ง nil กลับ
-                        completion(tchResult, nil)
-                    }
-                })
-
-
+            // Wait for sync — prepareMessage on an un-synced conversation can
+            // produce a builder that buildAndSend rejects.
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
+                conversation.prepareMessage()
+                    .setAttributes(attributesObject, error: nil)
+                    .setBody(messageText).buildAndSend(completion: { tchResult, tchMessages in
+                       if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
+                        completion(tchResult, messageSid)
+                        } else {
+                            completion(tchResult, nil)
+                        }
+                    })
+            }, onFailed: { msg in
+                print("sendMessage: sync wait failed: \(msg)")
+                completion(TCHResult(), nil)
+            })
         }
     }
 
@@ -306,42 +414,42 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         attributes: [String: Any],
         completion: @escaping (TCHResult, TCHMessage?) -> Void
     ) {
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
                 completion(TCHResult(), nil)
                 return
             }
-
-            // ✅ ดึง messages ล่าสุด (จำนวนมากพอ เช่น 200)
-            conversation.getLastMessages(withCount: 1000) { result, messages in
-                guard result.isSuccessful, let messages = messages as? [TCHMessage] else {
-                    print("Failed to load messages: \(result.resultText ?? "Unknown error")")
-                    completion(result, nil)
-                    return
-                }
-
-                // ✅ หา message ที่มี sid ตรงกัน
-                guard let targetMessage = messages.first(where: { $0.sid == msgId }) else {
-                    print("Message not found for sid: \(msgId)")
-                    completion(result, nil)
-                    return
-                }
-
-                let attributesObject = TCHJsonAttributes(dictionary: attributes)
-
-                // ✅ อัปเดตข้อความ
-                targetMessage.updateBody(messageText) { updateResult in
-                    if updateResult.isSuccessful {
-                        // ✅ อัปเดต attributes ต่อ
-                        targetMessage.setAttributes(attributesObject, completion: { attrResult in
-                            completion(attrResult, targetMessage)
-                        })
-                    } else {
-                        completion(updateResult, nil)
+            // Wait for sync before reading the message list — getLastMessages
+            // returns empty / errors when called before .all.
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                conversation.getLastMessages(withCount: 1000) { result, messages in
+                    guard result.isSuccessful, let messages = messages as? [TCHMessage] else {
+                        print("Failed to load messages: \(result.resultText ?? "Unknown error")")
+                        completion(result, nil)
+                        return
+                    }
+                    guard let targetMessage = messages.first(where: { $0.sid == msgId }) else {
+                        print("Message not found for sid: \(msgId)")
+                        completion(result, nil)
+                        return
+                    }
+                    let attributesObject = TCHJsonAttributes(dictionary: attributes)
+                    targetMessage.updateBody(messageText) { updateResult in
+                        if updateResult.isSuccessful {
+                            targetMessage.setAttributes(attributesObject, completion: { attrResult in
+                                completion(attrResult, targetMessage)
+                            })
+                        } else {
+                            completion(updateResult, nil)
+                        }
                     }
                 }
-            }
+            }, onFailed: { msg in
+                print("body(): sync wait failed: \(msg)")
+                completion(TCHResult(), nil)
+            })
         }
     }
 
@@ -362,7 +470,8 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             return
         }
 
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             guard let conversation = conversation else {
                 let errorResponse: [String: Any] = [
                     "error": "Conversation not found for id: \(conversationId)"
@@ -370,8 +479,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 completion(errorResponse)
                 return
             }
-
-            // ✅ ดึงข้อความล่าสุดทั้งหมด
+            self.runWhenConversationSynchronized(conversation, onReady: {
             conversation.getLastMessages(withCount: 1000) { result, messagesList in
                 guard result.isSuccessful, let messagesList = messagesList as? [TCHMessage] else {
                     let errorResponse: [String: Any] = [
@@ -443,6 +551,10 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                     completion(responseMap)
                 }
             }
+            }, onFailed: { msg in
+                print("updateMessages(): sync wait failed: \(msg)")
+                completion(["error": "Sync wait failed: \(msg)"])
+            })
         }
     }
 
@@ -481,45 +593,49 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                               fileName :String ,
                               completion: @escaping (TCHResult, TCHMessage?) -> Void) {
         // Fetch the conversation using the provided ID
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
                 completion(TCHResult(), nil)
                 return
             }
 
-            // Convert attributes dictionary into Attributes type
-            let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
-
+            // Open the input stream BEFORE waiting for sync — if the file is
+            // missing we can fail fast without holding the sync watcher open
+            // for 30 seconds.
             guard let fileInputStream = InputStream(fileAtPath: mediaFilePath) else {
                 print("Error opening media file at path: \(mediaFilePath)")
                 completion(TCHResult(), nil)
                 return
             }
 
-            // Prepare and send the message
-            conversation.prepareMessage()
-                .setAttributes(attributesObject, error: nil)
-                .setBody(messageText)
-                .addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
-                    onStarted: {
-                        print("Media upload started.")
-                    },
-                    onProgress: { bytesSent in
-                        print("Media upload progress: \(bytesSent) bytes sent.")
-                    },
-                    onCompleted: { mediaSid in
-                        print("Media uploaded successfully with SID: \(mediaSid)")
-                    },
-                    onFailed: { error in
-                        print("Media upload failed: \(error.localizedDescription )")
-                    }
-                ))
-                .buildAndSend(completion: { tchResult, tchMessages in
-                    completion(tchResult,tchMessages)
-                })
-
-
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
+                conversation.prepareMessage()
+                    .setAttributes(attributesObject, error: nil)
+                    .setBody(messageText)
+                    .addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
+                        onStarted: {
+                            print("Media upload started.")
+                        },
+                        onProgress: { bytesSent in
+                            print("Media upload progress: \(bytesSent) bytes sent.")
+                        },
+                        onCompleted: { mediaSid in
+                            print("Media uploaded successfully with SID: \(mediaSid)")
+                        },
+                        onFailed: { error in
+                            print("Media upload failed: \(error.localizedDescription )")
+                        }
+                    ))
+                    .buildAndSend(completion: { tchResult, tchMessages in
+                        completion(tchResult, tchMessages)
+                    })
+            }, onFailed: { msg in
+                print("sendMessageWithMedia: sync wait failed: \(msg)")
+                completion(TCHResult(), nil)
+            })
         }
     }
 
@@ -641,16 +757,21 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             completion([])
             return
         }
-        var listOfMessagess: [[String: Any]] = []
-        conversation.getLastMessages(withCount: messageCount ?? 1000) { (result, messages) in
-            guard let messagesList = messages else {
-                completion([])
-                return
+        runWhenConversationSynchronized(conversation, onReady: { [weak self] in
+            guard let self = self else { return }
+            conversation.getLastMessages(withCount: messageCount ?? 1000) { (result, messages) in
+                guard let messagesList = messages else {
+                    completion([])
+                    return
+                }
+                self.processMessagesSequentially(messagesList: messagesList, conversationSid: conversation.sid) { result in
+                    completion(result)
+                }
             }
-            self.processMessagesSequentially(messagesList: messagesList, conversationSid: conversation.sid) { result in
-                completion(result) // Return the final processed list
-            }
-        }
+        }, onFailed: { msg in
+            print("loadPreviousMessages: sync wait failed: \(msg)")
+            completion([])
+        })
     }
 
     func processMessagesSequentially(
@@ -724,23 +845,29 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             completion([])
             return
         }
-        var listOfMessagess: [[String: Any]] = []
-        conversation.getLastMessages(withCount: messageCount ?? 1) { (result, messages) in
-            guard let messagesList = messages else {
-                completion([])
-                return
+        runWhenConversationSynchronized(conversation, onReady: { [weak self] in
+            guard let self = self else { return }
+            conversation.getLastMessages(withCount: messageCount ?? 1) { (result, messages) in
+                guard let messagesList = messages else {
+                    completion([])
+                    return
+                }
+                self.processMessagesSequentiallyForParticipants(conversation, messagesList: messagesList) { result in
+                    completion(result)
+                }
             }
-            self.processMessagesSequentiallyForParticipants(conversation,messagesList: messagesList) { result in
-                completion(result) // Return the final processed list
-            }
-        }
+        }, onFailed: { msg in
+            print("getLastMessage: sync wait failed: \(msg)")
+            completion([])
+        })
     }
 
 
     func getUnReadMsgCount(conversationId: String, _ completion: @escaping ([[String: Any]]?) -> Void) {
         var list: [[String: Any]] = []
 
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             var dictionary: [String: Any] = [:]
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
@@ -750,22 +877,32 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 completion(list)
                 return
             }
-            conversation.getUnreadMessagesCount(completion: { result, count in
-                if result.isSuccessful {
-                    list.removeAll()
-                    print("Total Unread Count \(count)")
-                    dictionary["sid"] = conversationId
-                    dictionary["unReadCount"] = count
-                    list.append(dictionary)
-                    completion(list)
-                }
-                else{
-                    print("No Unread Count")
-                    dictionary["sid"] = conversationId
-                    dictionary["unReadCount"] = 0
-                    list.append(dictionary)
-                    completion(list)
-                }
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                conversation.getUnreadMessagesCount(completion: { result, count in
+                    if result.isSuccessful {
+                        list.removeAll()
+                        print("Total Unread Count \(count)")
+                        dictionary["sid"] = conversationId
+                        dictionary["unReadCount"] = count
+                        list.append(dictionary)
+                        completion(list)
+                    }
+                    else{
+                        print("No Unread Count")
+                        dictionary["sid"] = conversationId
+                        dictionary["unReadCount"] = 0
+                        list.append(dictionary)
+                        completion(list)
+                    }
+                })
+            }, onFailed: { msg in
+                print("getUnReadMsgCount: sync wait failed: \(msg)")
+                var errorDict: [String: Any] = [:]
+                errorDict["sid"] = conversationId
+                errorDict["unReadCount"] = 0
+                list.removeAll()
+                list.append(errorDict)
+                completion(list)
             })
         }
     }
@@ -943,10 +1080,9 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     ///   - Client-init guard added (matches every other public entry).
     ///   - Empty messageSid rejected up front.
     ///   - All paths invoke completion exactly once (PR #3 discipline).
-    /// Residual risk: getLastMessages(withCount:) is not wrapped in an
-    /// iOS sync-wait helper (I2 in the fork bug review — not yet ported
-    /// from Android). If the conversation hasn't reached sync ALL, the
-    /// SDK may still callback with an error which we surface verbatim.
+    ///   - getLastMessages call is now wrapped in
+    ///     `runWhenConversationSynchronized` so the lookup waits for
+    ///     `.all` sync status rather than reading an empty list.
     func deleteMessageWithSid(conversationId: String,
                               messageSid: String,
                               messageCount: Int,
@@ -960,11 +1096,13 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             return
         }
         let searchCount = max(messageCount, 1)
-        getConversationFromId(conversationId: conversationId) { conversation in
+        getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else { return }
             guard let conversation = conversation else {
                 completion("conv_failed: Conversation not found")
                 return
             }
+            self.runWhenConversationSynchronized(conversation, onReady: {
             conversation.getLastMessages(withCount: UInt(searchCount)) { result, messages in
                 guard result.isSuccessful, let messages = messages else {
                     let err = result.error?.localizedDescription ?? "unknown"
@@ -986,6 +1124,10 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                     }
                 }
             }
+            }, onFailed: { msg in
+                print("deleteMessageWithSid: sync wait failed: \(msg)")
+                completion("Sync error: \(msg)")
+            })
         }
     }
 
@@ -1007,6 +1149,44 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         } else {
             completion("Client already shutdown or not initialized")
         }
+    }
+}
+
+/// Internal record of a single in-flight sync-wait registration. Owned by
+/// `ConversationsHandler.syncWaiters` and the `DispatchSourceTimer` it
+/// schedules. `handled` guards against the timer + the delegate callback
+/// racing to deliver completion twice.
+fileprivate final class SyncWaiter {
+    let onReady: () -> Void
+    let onFailed: (String) -> Void
+    var handled: Bool = false
+    var timer: DispatchSourceTimer?
+
+    init(onReady: @escaping () -> Void, onFailed: @escaping (String) -> Void) {
+        self.onReady = onReady
+        self.onFailed = onFailed
+    }
+
+    /// Always invoked on .main. Returns true iff this call actually fired
+    /// the completion (i.e. the waiter wasn't already handled by a peer).
+    @discardableResult
+    func fireReady() -> Bool {
+        guard !handled else { return false }
+        handled = true
+        timer?.cancel()
+        timer = nil
+        onReady()
+        return true
+    }
+
+    @discardableResult
+    func fireFailed(_ message: String) -> Bool {
+        guard !handled else { return false }
+        handled = true
+        timer?.cancel()
+        timer = nil
+        onFailed(message)
+        return true
     }
 }
 
