@@ -67,15 +67,28 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             //                  result("")
             //              }
             //          }
+            result(FlutterMethodNotImplemented)
             break
         case Methods.registerFCMToken:
             conversationsHandler.registerFCMToken(token: arguments?["fcmToken"] as! String) { success in
-                result("Token Registerd")
+                if success {
+                    result("Token Registerd")
+                } else {
+                    result(FlutterError(code: "FCM_REGISTER_FAILED",
+                                        message: "Failed to register FCM token",
+                                        details: nil))
+                }
             }
             break
         case Methods.unregisterFCMToken:
             conversationsHandler.unregisterFCMToken(token: arguments?["fcmToken"] as! String) { success in
-                result("Token unregisterFCMToken")
+                if success {
+                    result("Token unregisterFCMToken")
+                } else {
+                    result(FlutterError(code: "FCM_UNREGISTER_FAILED",
+                                        message: "Failed to unregister FCM token",
+                                        details: nil))
+                }
             }
             break
         case Methods.updateAccessToken:
@@ -97,7 +110,10 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
         case Methods.initializeConversationClient:
             self.conversationsHandler.clientDelegate = self
             self.conversationsHandler.loginWithAccessToken(arguments?["accessToken"] as! String) { loginResult in
-                guard let loginResultSuccessful: Bool = loginResult?.isSuccessful else {return}
+                guard let loginResultSuccessful: Bool = loginResult?.isSuccessful else {
+                    result(Strings.authenticationFailed)
+                    return
+                }
                 if(loginResultSuccessful) {
                     result(Strings.authenticationSuccessful)
                 }else {
@@ -108,11 +124,17 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
         case Methods.createConversation:
             self.conversationsHandler.createConversation (uniqueConversationName: arguments?["conversationName"] as! String){ (success, conversation,status)  in
                 if success, let conversation = conversation {
-                    self.conversationsHandler.joinConversation(conversation) { joinConversationStatus in}
+                    self.conversationsHandler.joinConversation(conversation) { joinConversationStatus in
+                        if joinConversationStatus == nil {
+                            print("createConversation: created \(conversation.sid ?? "?") but auto-join failed")
+                        }
+                    }
                     result(Strings.createConversationSuccess)
                 }else {
                     if (status == Strings.conversationExists) {
                         result(Strings.conversationExists)
+                    } else if (status == Strings.clientNotInitialized) {
+                        result(Strings.clientNotInitialized)
                     } else {
                         result(Strings.createConversationFailure)
                     }
@@ -235,51 +257,61 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
  
         case Methods.addParticipant:
             self.conversationsHandler.addParticipants(conversationId: arguments?["conversationId"] as! String, participantName: arguments?["participantName"] as! String) { status in
-                if let addParticipantStatus = status {
-                    if (addParticipantStatus.isSuccessful){
-                        result(Strings.addParticipantSuccess)
-                    }else {
-                        result(addParticipantStatus.resultText)
-                    }
+                guard let addParticipantStatus = status else {
+                    result("Conversation not found")
+                    return
+                }
+                if (addParticipantStatus.isSuccessful){
+                    result(Strings.addParticipantSuccess)
+                }else {
+                    result(addParticipantStatus.resultText)
                 }
             }
             break
         case Methods.removeParticipant:
             self.conversationsHandler.removeParticipants(conversationId: arguments?["conversationId"] as! String, participantName: arguments?["participantName"] as! String) { status in
-                if let removeParticipantStatus = status {
-                    if (removeParticipantStatus.isSuccessful){
-                        result(Strings.removedParticipantSuccess)
-                    }else {
-                        result(removeParticipantStatus.resultText)
-                    }
+                guard let removeParticipantStatus = status else {
+                    result("Conversation not found")
+                    return
+                }
+                if (removeParticipantStatus.isSuccessful){
+                    result(Strings.removedParticipantSuccess)
+                }else {
+                    result(removeParticipantStatus.resultText)
                 }
             }
             break
         case Methods.joinConversation:
             self.conversationsHandler.getConversationFromId(conversationId: arguments?["conversationId"] as! String) { conversation in
-                if let conversationFromId = conversation {
-                    self.conversationsHandler.joinConversation(conversationFromId) { tchConversationStatus in
-                        result(tchConversationStatus)
-                    }
+                guard let conversationFromId = conversation else {
+                    result("Conversation not found")
+                    return
+                }
+                self.conversationsHandler.joinConversation(conversationFromId) { tchConversationStatus in
+                    result(tchConversationStatus)
                 }
             }
         case Methods.getMessages:
             self.conversationsHandler.getConversationFromId(conversationId: arguments?["conversationId"] as! String) { conversation in
+                guard let conversationFromId = conversation else {
+                    result([])
+                    return
+                }
                 self.conversationsHandler.conversationId = arguments?["conversationId"] as? String
-                if let conversationFromId = conversation {
-                    self.conversationsHandler.loadPreviousMessages(conversationFromId,arguments?["messageCount"] as? UInt) { listOfMessages in
-                        result(listOfMessages)
-                    }
+                self.conversationsHandler.loadPreviousMessages(conversationFromId,arguments?["messageCount"] as? UInt) { listOfMessages in
+                    result(listOfMessages)
                 }
             }
             break
         case Methods.getLastMessages:
             self.conversationsHandler.getConversationFromId(conversationId: arguments?["conversationId"] as! String) { conversation in
-                if let conversationFromId = conversation {
-                    self.conversationsHandler.getLastMessage(conversationFromId,arguments?["messageCount"] as? UInt) { listOfMessages in
-                        //                      print("listOfMessagess->\(String(describing: listOfMessages))")
-                        result(listOfMessages)
-                    }
+                guard let conversationFromId = conversation else {
+                    result([])
+                    return
+                }
+                self.conversationsHandler.getLastMessage(conversationFromId,arguments?["messageCount"] as? UInt) { listOfMessages in
+                    //                      print("listOfMessagess->\(String(describing: listOfMessages))")
+                    result(listOfMessages)
                 }
             }
             break
@@ -295,7 +327,9 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 if (tchResult.isSuccessful){
                     result(tchMessages ?? "")
                 }else {
-                    result(tchResult.resultText)
+                    result(FlutterError(code: "SEND_FAILED",
+                                        message: tchResult.resultText ?? "Conversation not found",
+                                        details: nil))
                 }
             }
             break
@@ -324,7 +358,9 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                     print("sendMessageWithMedia send success")
                     result("send")
                 }else {
-                    result(tchResult.resultText)
+                    result(FlutterError(code: "SEND_FAILED",
+                                        message: tchResult.resultText ?? "Conversation not found",
+                                        details: nil))
                 }
             }
 
@@ -344,7 +380,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 //MARK: TODO
                 self.conversationsHandler.getConversationFromId(conversationId: arguments?["conversationId"] as! String) { conversation in
                     self.conversationsHandler.messageDelegate?.onSynchronizationChanged(status: ["status" : conversation?.synchronizationStatus.rawValue])
-                    
+
                     //MARK: setLastReadMessageIndex
                     conversation?.setLastReadMessageIndex(conversation?.lastMessageIndex ?? 0, completion: { result, index in
                         print("setLastReadMessageIndex\(result.description)")
@@ -352,11 +388,22 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                     })
                 }
                 self.conversationsHandler.isSubscribe = true
+                result("subscribed")
+            } else {
+                result(FlutterError(code: "INVALID_ARGS",
+                                    message: "conversationId required",
+                                    details: nil))
             }
-            
+
             break
         case Methods.unSubscribeToMessageUpdate:
-            self.conversationsHandler.getConversationFromId(conversationId: arguments?["conversationId"] as! String) { conversation in
+            guard let conversationId = arguments?["conversationId"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS",
+                                    message: "conversationId required",
+                                    details: nil))
+                break
+            }
+            self.conversationsHandler.getConversationFromId(conversationId: conversationId) { conversation in
 //                self.conversationsHandler.lastReadIndex = conversation?.lastMessageIndex
 //                conversation?.setLastReadMessageIndex(conversation?.lastMessageIndex ?? 0, completion: { result, index in
 //                    print("setLastReadMessageIndex \(result.description)")
@@ -366,6 +413,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             self.conversationsHandler.conversationId = nil
             conversationsHandler.isSubscribe = nil
             conversationsHandler.messageDelegate = nil
+            result("unsubscribed")
 
             break
         case Methods.isClientInitialized:

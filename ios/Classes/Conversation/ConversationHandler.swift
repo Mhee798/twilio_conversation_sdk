@@ -181,11 +181,13 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         let data = token.hexToData
         //        print(data) // Output: 5 bytes
 
-
-        self.client?.register(withNotificationToken: data ?? Data(), completion: { result in
-            if result.isSuccessful {
-                completion(true)
-            }
+        guard let client = self.client else {
+            print("FCM register: client not initialized")
+            completion(false)
+            return
+        }
+        client.register(withNotificationToken: data ?? Data(), completion: { result in
+            completion(result.isSuccessful)
             print("Twilio Notification Token Set: \(result) with token \(token)")
             print("Device push token registration was\(result.isSuccessful ? "" : " not") successful")
         })
@@ -196,11 +198,13 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         let data = token.hexToData
         //        print(data) // Output: 5 bytes
 
-
-        self.client?.deregister(withNotificationToken: data ?? Data(), completion: { result in
-            if result.isSuccessful {
-                completion(true)
-            }
+        guard let client = self.client else {
+            print("FCM unregister: client not initialized")
+            completion(false)
+            return
+        }
+        client.deregister(withNotificationToken: data ?? Data(), completion: { result in
+            completion(result.isSuccessful)
             print("Twilio Notification Token deregister: \(result) with token \(token)")
             print("Device push token deregister \(result.isSuccessful ? "" : " not") successful")
         })
@@ -269,19 +273,17 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                      completion: @escaping (TCHResult, String?) -> Void) {
         // Fetch the conversation using the provided ID
         self.getConversationFromId(conversationId: conversationId) { conversation in
-            //            if let error = error {
-            //                print("Error fetching conversation: \(error.localizedDescription)")
-            //                result(.failure(error))
-            //                return
-            //            }
-
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(TCHResult(), nil)
+                return
+            }
 
             // Convert attributes dictionary into Attributes type
-
             let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
 
             // Prepare and send the message
-            conversation?.prepareMessage()
+            conversation.prepareMessage()
                 .setAttributes(attributesObject, error: nil)
                 .setBody(messageText).buildAndSend(completion: { tchResult, tchMessages in
                    if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
@@ -480,24 +482,23 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                               completion: @escaping (TCHResult, TCHMessage?) -> Void) {
         // Fetch the conversation using the provided ID
         self.getConversationFromId(conversationId: conversationId) { conversation in
-            //            if let error = error {
-            //                print("Error fetching conversation: \(error.localizedDescription)")
-            //                result(.failure(error))
-            //                return
-            //            }
-
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(TCHResult(), nil)
+                return
+            }
 
             // Convert attributes dictionary into Attributes type
-
             let attributesObject : TCHJsonAttributes = TCHJsonAttributes(dictionary: attributes)
 
             guard let fileInputStream = InputStream(fileAtPath: mediaFilePath) else {
                 print("Error opening media file at path: \(mediaFilePath)")
+                completion(TCHResult(), nil)
                 return
             }
 
             // Prepare and send the message
-            conversation?.prepareMessage()
+            conversation.prepareMessage()
                 .setAttributes(attributesObject, error: nil)
                 .setBody(messageText)
                 .addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
@@ -546,6 +547,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func createConversation(uniqueConversationName:String,_ completion: @escaping (Bool, TCHConversation?,String) -> Void) {
         guard isClientInitialized(), let client = client else {
+            completion(false, nil, Strings.clientNotInitialized)
             return
         }
         // Create the conversation if it hasn't been created yet
@@ -564,6 +566,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func getConversations(_ completion: @escaping([TCHConversation]) -> Void) {
         guard isClientInitialized(), let client = client else {
+            completion([])
             return
         }
 
@@ -578,7 +581,12 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func addParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?) -> Void) {
         self.getConversationFromId(conversationId: conversationId) { conversation in
-            conversation?.addParticipant(byIdentity: participantName, attributes: nil,completion: { status in
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(nil)
+                return
+            }
+            conversation.addParticipant(byIdentity: participantName, attributes: nil,completion: { status in
                 completion(status)
             })
         }
@@ -586,7 +594,12 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func removeParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?) -> Void) {
         self.getConversationFromId(conversationId: conversationId) { conversation in
-            conversation?.removeParticipant(byIdentity: participantName,completion: { status in
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(nil)
+                return
+            }
+            conversation.removeParticipant(byIdentity: participantName,completion: { status in
                 print("status->\(status)")
                 completion(status)
             })
@@ -596,46 +609,47 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     func joinConversation(_ conversation: TCHConversation,_ completion: @escaping(String?) -> Void) {
         if conversation.status == .joined {
-            //            self.loadPreviousMessages(conversation,1000) { listOfMessages in
-            //
-            //            }
+            completion(conversation.sid)
         } else {
             conversation.join(completion: { result in
                 if result.isSuccessful {
-                    //                    self.loadPreviousMessages(conversation,1000) { listOfMessages in
-                    //
-                    //                    }
+                    completion(conversation.sid)
+                } else {
+                    completion(nil)
                 }
             })
         }
-        completion(conversation.sid)
     }
 
     func getConversationFromId(conversationId:String,_ completion: @escaping(TCHConversation?) -> Void){
         guard isClientInitialized(), let client = client else {
+            print("getConversationFromId: client not initialized for id: \(conversationId)")
+            completion(nil)
             return
         }
         client.conversation(withSidOrUniqueName: conversationId) { (result, conversation) in
-            if let conversationFromSid = conversation {
-                print("message readed")
-                completion(conversationFromSid)
+            if conversation == nil {
+                print("getConversationFromId: Twilio lookup failed for id: \(conversationId) — isSuccessful=\(result.isSuccessful), resultText=\(result.resultText ?? "nil"), error=\(result.error?.localizedDescription ?? "nil")")
             }
+            completion(conversation)
         }
     }
 
     func loadPreviousMessages(_ conversation: TCHConversation,_ messageCount: UInt?,_ completion: @escaping([[String: Any]]?) -> Void) {
         print("synchronizationStatus->\(isClientInitialized())")
         guard isClientInitialized() else {
+            completion([])
             return
         }
         var listOfMessagess: [[String: Any]] = []
         conversation.getLastMessages(withCount: messageCount ?? 1000) { (result, messages) in
-            if let messagesList = messages {
-                self.processMessagesSequentially(messagesList: messagesList, conversationSid: conversation.sid) { result in
-                    completion(result) // Return the final processed list
-                }
+            guard let messagesList = messages else {
+                completion([])
+                return
             }
-
+            self.processMessagesSequentially(messagesList: messagesList, conversationSid: conversation.sid) { result in
+                completion(result) // Return the final processed list
+            }
         }
     }
 
@@ -707,14 +721,17 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
     func getLastMessage(_ conversation: TCHConversation,_ messageCount: UInt?,_ completion: @escaping([[String: Any]]?) -> Void) {
         print("synchronizationStatus->\(isClientInitialized())")
         guard isClientInitialized() else {
+            completion([])
             return
         }
         var listOfMessagess: [[String: Any]] = []
         conversation.getLastMessages(withCount: messageCount ?? 1) { (result, messages) in
-            if let messagesList = messages {
-                self.processMessagesSequentiallyForParticipants(conversation,messagesList: messagesList) { result in
-                    completion(result) // Return the final processed list
-                }
+            guard let messagesList = messages else {
+                completion([])
+                return
+            }
+            self.processMessagesSequentiallyForParticipants(conversation,messagesList: messagesList) { result in
+                completion(result) // Return the final processed list
             }
         }
     }
@@ -725,7 +742,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
         self.getConversationFromId(conversationId: conversationId) { conversation in
             var dictionary: [String: Any] = [:]
-            conversation?.getUnreadMessagesCount(completion: { result, count in
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                dictionary["sid"] = conversationId
+                dictionary["unReadCount"] = 0
+                list.append(dictionary)
+                completion(list)
+                return
+            }
+            conversation.getUnreadMessagesCount(completion: { result, count in
                 if result.isSuccessful {
                     list.removeAll()
                     print("Total Unread Count \(count)")
@@ -738,6 +763,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                     print("No Unread Count")
                     dictionary["sid"] = conversationId
                     dictionary["unReadCount"] = 0
+                    list.append(dictionary)
                     completion(list)
                 }
             })
