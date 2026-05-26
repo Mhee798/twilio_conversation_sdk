@@ -1616,6 +1616,78 @@ public class ConversationHandler {
         });
     }
 
+    /// Delete message by sid #
+    // Ported from ALAlliancetek fork (v0.4.0). Adapted to our fork:
+    //   - isClientInitialized guard added (matches every other public entry).
+    //   - getLastMessages call wrapped with runWhenConversationSynchronized
+    //     so it inherits PR #1's IllegalStateException protection — ALAT's
+    //     version called the SDK directly and would crash if the conversation
+    //     hadn't reached SynchronizationStatus.ALL yet.
+    //   - findMessageBySid helper inlined; replies use result.success(string)
+    //     instead of result.error(...) to match the rest of this fork (Dart
+    //     callers treat the response as a status string).
+    public static void deleteMessageWithSid(String conversationId, String messageSid, Integer messageCount,
+            MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
+        if (messageSid == null || messageSid.isEmpty()) {
+            result.success(Strings.failed + ": messageSid is required");
+            return;
+        }
+        final int searchCount = (messageCount != null && messageCount > 0) ? messageCount : 1000;
+        conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
+            @Override
+            public void onSuccess(Conversation conversation) {
+                runWhenConversationSynchronized(conversation,
+                        () -> conversation.getLastMessages(searchCount, new CallbackListener<List<Message>>() {
+                            @Override
+                            public void onSuccess(List<Message> messages) {
+                                Message found = null;
+                                if (messages != null) {
+                                    for (Message msg : messages) {
+                                        if (messageSid.equals(msg.getSid())) {
+                                            found = msg;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (found == null) {
+                                    result.success("msg_not_found: SID not in last " + searchCount + " messages");
+                                    return;
+                                }
+                                conversation.removeMessage(found, new StatusListener() {
+                                    @Override
+                                    public void onSuccess() {
+                                        result.success(Strings.success);
+                                    }
+
+                                    @Override
+                                    public void onError(ErrorInfo errorInfo) {
+                                        StatusListener.super.onError(errorInfo);
+                                        result.success("delete_failed: " + errorInfo.getMessage());
+                                    }
+                                });
+                            }
+
+                            @Override
+                            public void onError(ErrorInfo errorInfo) {
+                                CallbackListener.super.onError(errorInfo);
+                                result.success("getLastMessages error: " + errorInfo.getMessage());
+                            }
+                        }),
+                        errMsg -> result.success("Sync error: " + errMsg));
+            }
+
+            @Override
+            public void onError(ErrorInfo errorInfo) {
+                CallbackListener.super.onError(errorInfo);
+                result.success("conv_failed: " + errorInfo.getMessage());
+            }
+        });
+    }
+
     public static void initializeConversationClient(String accessToken, MethodChannel.Result result,
             ClientInterface clientInterface) {
         ConversationsClient.Properties props = ConversationsClient.Properties.newBuilder().createProperties();

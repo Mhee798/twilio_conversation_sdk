@@ -425,6 +425,40 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 result(shutdownResult)
             }
             break
+        case Methods.deleteConversation:
+            // Ported from ALAlliancetek fork. ALAT's original used
+            // `as! String` which traps on missing/mistyped arguments;
+            // PR #3 (I4) replaced that pattern with guard-let across
+            // the file — apply the same here.
+            guard let conversationId = arguments?["conversationId"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS",
+                                    message: "deleteConversation requires conversationId:String",
+                                    details: nil))
+                break
+            }
+            self.conversationsHandler.deleteConversation(conversationId: conversationId) { resultString in
+                result(resultString)
+            }
+            break
+        case Methods.deleteMessageWithSid:
+            guard let conversationId = arguments?["conversationId"] as? String,
+                  let messageSid = arguments?["messageSid"] as? String else {
+                result(FlutterError(code: "INVALID_ARGS",
+                                    message: "deleteMessageWithSid requires conversationId:String, messageSid:String",
+                                    details: nil))
+                break
+            }
+            // Dart `int` bridges as NSNumber/Int — coerce via Int to
+            // accept both, default to 100 when missing.
+            let messageCount = (arguments?["messageCount"] as? Int) ?? 100
+            self.conversationsHandler.deleteMessageWithSid(
+                conversationId: conversationId,
+                messageSid: messageSid,
+                messageCount: messageCount
+            ) { resultString in
+                result(resultString)
+            }
+            break
         default:
             break
         }

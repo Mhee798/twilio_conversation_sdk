@@ -173,6 +173,18 @@ public class TwilioConversationSdkPlugin implements FlutterPlugin, MethodCallHan
                 ConversationHandler.deleteMessage(call.argument("conversationId"), idx.longValue(), result);
                 break;
             }
+            case Methods.deleteMessageWithSid: {
+                // Same Dart-int bridging concern as deleteMessage: coerce
+                // via Number to accept both Integer and Long arrivals.
+                Number count = call.argument("messageCount");
+                Integer messageCount = (count != null) ? count.intValue() : null;
+                ConversationHandler.deleteMessageWithSid(
+                        call.argument("conversationId"),
+                        call.argument("messageSid"),
+                        messageCount,
+                        result);
+                break;
+            }
             case Methods.setTypingStatus:
                 ConversationHandler.setTypingStatus(call.argument("conversationId"), call.argument("isTyping"), result);
                 break;

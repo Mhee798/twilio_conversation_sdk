@@ -913,6 +913,82 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
     // MARK: - Shutdown Client
     /// Shuts down and cleans up the Twilio Conversations Client
+    /// Delete an entire conversation. Ported from ALAlliancetek fork
+    /// (v0.4.0). Adapted to our completion-discipline patterns from PR #3:
+    /// every path invokes completion exactly once, errors are surfaced
+    /// rather than swallowed.
+    func deleteConversation(conversationId: String, completion: @escaping (String) -> Void) {
+        guard isClientInitialized() else {
+            completion(Strings.clientNotInitialized)
+            return
+        }
+        getConversationFromId(conversationId: conversationId) { conversation in
+            guard let conversation = conversation else {
+                completion("conv_failed: Conversation not found")
+                return
+            }
+            conversation.destroy { result in
+                if result.isSuccessful {
+                    completion("success")
+                } else {
+                    print("deleteConversation: \(result.error?.localizedDescription ?? "unknown")")
+                    completion("delete_failed: \(result.error?.localizedDescription ?? "unknown")")
+                }
+            }
+        }
+    }
+
+    /// Delete a single message by sid. Ported from ALAlliancetek fork
+    /// (v0.4.1). Adapted to our fork:
+    ///   - Client-init guard added (matches every other public entry).
+    ///   - Empty messageSid rejected up front.
+    ///   - All paths invoke completion exactly once (PR #3 discipline).
+    /// Residual risk: getLastMessages(withCount:) is not wrapped in an
+    /// iOS sync-wait helper (I2 in the fork bug review — not yet ported
+    /// from Android). If the conversation hasn't reached sync ALL, the
+    /// SDK may still callback with an error which we surface verbatim.
+    func deleteMessageWithSid(conversationId: String,
+                              messageSid: String,
+                              messageCount: Int,
+                              completion: @escaping (String) -> Void) {
+        guard isClientInitialized() else {
+            completion(Strings.clientNotInitialized)
+            return
+        }
+        guard !messageSid.isEmpty else {
+            completion("failed: messageSid is required")
+            return
+        }
+        let searchCount = max(messageCount, 1)
+        getConversationFromId(conversationId: conversationId) { conversation in
+            guard let conversation = conversation else {
+                completion("conv_failed: Conversation not found")
+                return
+            }
+            conversation.getLastMessages(withCount: UInt(searchCount)) { result, messages in
+                guard result.isSuccessful, let messages = messages else {
+                    let err = result.error?.localizedDescription ?? "unknown"
+                    print("deleteMessageWithSid: getLastMessages failed: \(err)")
+                    completion("getLastMessages error: \(err)")
+                    return
+                }
+                guard let message = messages.first(where: { $0.sid == messageSid }) else {
+                    completion("msg_not_found: SID not in last \(searchCount) messages")
+                    return
+                }
+                conversation.remove(message) { deleteResult in
+                    if deleteResult.isSuccessful {
+                        completion("success")
+                    } else {
+                        let err = deleteResult.error?.localizedDescription ?? "unknown"
+                        print("deleteMessageWithSid: remove failed: \(err)")
+                        completion("delete_failed: \(err)")
+                    }
+                }
+            }
+        }
+    }
+
     func shutdownClient(completion: @escaping (String) -> Void) {
         if let client = self.client {
             // Shutdown the client
