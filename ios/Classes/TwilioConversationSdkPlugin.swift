@@ -289,9 +289,13 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 result(FlutterError(code: "INVALID_ARGS", message: "addParticipant requires conversationId:String, participantName:String", details: nil))
                 break
             }
-            self.conversationsHandler.addParticipants(conversationId: conversationId, participantName: participantName) { status in
+            self.conversationsHandler.addParticipants(conversationId: conversationId, participantName: participantName) { status, failureReason in
                 guard let addParticipantStatus = status else {
-                    result("Conversation not found")
+                    // Prefer the handler's specific reason (timeout /
+                    // sync-fail / handler-released) over the generic
+                    // "Conversation not found" so retry/diagnostic logic
+                    // upstream can distinguish them.
+                    result(failureReason ?? "Conversation not found")
                     return
                 }
                 if (addParticipantStatus.isSuccessful){
@@ -307,9 +311,9 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 result(FlutterError(code: "INVALID_ARGS", message: "removeParticipant requires conversationId:String, participantName:String", details: nil))
                 break
             }
-            self.conversationsHandler.removeParticipants(conversationId: conversationId, participantName: participantName) { status in
+            self.conversationsHandler.removeParticipants(conversationId: conversationId, participantName: participantName) { status, failureReason in
                 guard let removeParticipantStatus = status else {
-                    result("Conversation not found")
+                    result(failureReason ?? "Conversation not found")
                     return
                 }
                 if (removeParticipantStatus.isSuccessful){

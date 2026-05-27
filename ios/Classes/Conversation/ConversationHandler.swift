@@ -203,9 +203,18 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 }
 
                 if (isSubscribe ?? false && conversationId == conversation.sid ){
-                    conversation.setLastReadMessageIndex(computedIndex) { result, index in
-                        print("setLastReadMessageIndex \(result.description)")
-                    }
+                    // Wait for sync — setLastReadMessageIndex on an
+                    // un-synced conversation can throw the SDK equivalent
+                    // of Android's IllegalStateException. Fire-and-forget
+                    // semantics: no completion to satisfy, just guard the
+                    // SDK call.
+                    self.runWhenConversationSynchronized(conversation, onReady: {
+                        conversation.setLastReadMessageIndex(computedIndex) { result, index in
+                            print("setLastReadMessageIndex \(result.description)")
+                        }
+                    }, onFailed: { msg in
+                        print("messageAdded.setLastReadMessageIndex: sync wait failed: \(msg)")
+                    })
                 }
 
 
@@ -444,11 +453,22 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                         print("sendMessage: setAttributes rejected: \(attrError.localizedDescription)")
                     }
                 }
+                // Bound buildAndSend so a dropped SDK callback can't hang
+                // the Dart Future. anyvet retries with a 4s Dart timeout
+                // anyway, but resolving natively saves the retry budget
+                // for a real network round-trip.
+                let shot = OneShot()
+                shot.arm(seconds: 30) {
+                    completion(TCHResult(), nil, "buildAndSend timed out after 30s")
+                }
                 builder.buildAndSend(completion: { tchResult, tchMessages in
-                    if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
-                        completion(tchResult, messageSid, nil)
-                    } else {
-                        completion(tchResult, nil, tchResult.resultText)
+                    DispatchQueue.main.async {
+                        guard shot.complete() else { return }
+                        if tchResult.isSuccessful, let messageSid = tchMessages?.sid {
+                            completion(tchResult, messageSid, nil)
+                        } else {
+                            completion(tchResult, nil, tchResult.resultText)
+                        }
                     }
                 })
             }, onFailed: { msg in
@@ -548,14 +568,25 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 return
             }
             self.runWhenConversationSynchronized(conversation, onReady: {
+            // Outer watchdog: protect the prerequisite getLastMessages
+            // call. If it drops, we never enter the per-message loop
+            // and no per-message OneShot is ever armed, so the Dart
+            // Future would hang forever without this guard.
+            let outerShot = OneShot()
+            outerShot.arm(seconds: 30) {
+                completion(["error": "Sync error: updateMessages getLastMessages timed out after 30s"])
+            }
             conversation.getLastMessages(withCount: 1000) { result, messagesList in
+                DispatchQueue.main.async {
                 guard result.isSuccessful, let messagesList = messagesList as? [TCHMessage] else {
+                    guard outerShot.complete() else { return }
                     let errorResponse: [String: Any] = [
                         "error": "Failed to load messages: \(result.resultText ?? "Unknown error")"
                     ]
                     completion(errorResponse)
                     return
                 }
+                guard outerShot.complete() else { return }
 
                 var successList: [String] = []
                 var errorList: [String] = []
@@ -583,27 +614,60 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                         attributesObject = TCHJsonAttributes(dictionary: newAttribute)
                     }
 
-                    // ✅ อัปเดต body ก่อน
+                    // Per-message watchdog: if either updateBody or
+                    // setAttributes silently drops its callback, the group
+                    // would never reach .notify and updateMessages would
+                    // hang the Dart Future. Cap each message at 30s and
+                    // log a timeout error so the rest of the batch can
+                    // still resolve.
+                    let perMessageShot = OneShot()
+                    perMessageShot.arm(seconds: 30) {
+                        errorList.append("\(msgId): timed out after 30s")
+                        dispatchGroup.leave()
+                    }
                     targetMessage.updateBody(newBody) { updateResult in
-                        if updateResult.isSuccessful {
-                            // ✅ จากนั้นอัปเดต attributes ต่อ (ถ้ามี)
-                            if let attributes = attributesObject {
-                                targetMessage.setAttributes(attributes) { attrResult in
-                                    if attrResult.isSuccessful {
-                                        successList.append(msgId)
-                                    } else {
-                                        errorList.append("\(msgId): setAttributes error - \(attrResult.resultText ?? "Unknown error")")
+                        DispatchQueue.main.async {
+                            if updateResult.isSuccessful {
+                                if let attributes = attributesObject {
+                                    // Gate the setAttributes launch on the
+                                    // perMessageShot still being live, so a
+                                    // late updateBody callback that arrives
+                                    // after the timeout fired doesn't issue
+                                    // an extra SDK write that Dart never
+                                    // hears about. If we won the race, the
+                                    // perMessageShot is already consumed;
+                                    // arm stage2 for setAttributes.
+                                    guard perMessageShot.complete() else {
+                                        // Timer already fired and left the
+                                        // group; discard this late callback.
+                                        return
                                     }
+                                    let stage2 = OneShot()
+                                    stage2.arm(seconds: 30) {
+                                        errorList.append("\(msgId): setAttributes timed out after 30s")
+                                        dispatchGroup.leave()
+                                    }
+                                    targetMessage.setAttributes(attributes) { attrResult in
+                                        DispatchQueue.main.async {
+                                            guard stage2.complete() else { return }
+                                            if attrResult.isSuccessful {
+                                                successList.append(msgId)
+                                            } else {
+                                                errorList.append("\(msgId): setAttributes error - \(attrResult.resultText ?? "Unknown error")")
+                                            }
+                                            dispatchGroup.leave()
+                                        }
+                                    }
+                                } else {
+                                    guard perMessageShot.complete() else { return }
+                                    successList.append(msgId)
                                     dispatchGroup.leave()
                                 }
                             } else {
-                                // ไม่มี attributes ให้ update, ถือว่าสำเร็จ
-                                successList.append(msgId)
+                                guard perMessageShot.complete() else { return }
+                                errorList.append("\(msgId): updateBody error - \(updateResult.resultText ?? "Unknown error")")
                                 dispatchGroup.leave()
                             }
-                        } else {
-                            errorList.append("\(msgId): updateBody error - \(updateResult.resultText ?? "Unknown error")")
-                            dispatchGroup.leave()
                         }
                     }
                 }
@@ -618,7 +682,8 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                     ]
                     completion(responseMap)
                 }
-            }
+                } // close DispatchQueue.main.async
+            } // close getLastMessages closure
             }, onFailed: { msg in
                 print("updateMessages(): sync wait failed: \(msg)")
                 completion(["error": "Sync error: \(msg)"])
@@ -632,23 +697,33 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         isTyping: Bool,
         completion: @escaping (String) -> Void
     ) {
-        self.getConversationFromId(conversationId: conversationId) { conversation in
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else {
+                completion("Conversation not found")
+                return
+            }
             guard let conversation = conversation else {
                 print("Conversation not found for id: \(conversationId)")
                 completion("Conversation not found")
                 return
             }
-
-            if isTyping {
-                // ✅ เริ่มพิมพ์
-                conversation.typing()
-                print("Typing started for conversationId: \(conversationId)")
-                completion("started")
-            } else {
-                // ✅ หยุดพิมพ์ (Twilio จะหมดอายุ typing เองภายใน ~5 วินาที)
-                print("Typing ended for conversationId: \(conversationId)")
-                completion("ended")
-            }
+            // typing() is fire-and-forget on the SDK side, but the bug
+            // review's I2 list specifically calls out un-synced
+            // conversations rejecting typing() too. Funnel through the
+            // same sync-wait helper as the other write paths.
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                if isTyping {
+                    conversation.typing()
+                    print("Typing started for conversationId: \(conversationId)")
+                    completion("started")
+                } else {
+                    print("Typing ended for conversationId: \(conversationId)")
+                    completion("ended")
+                }
+            }, onFailed: { msg in
+                print("setTypingStatus: sync wait failed: \(msg)")
+                completion("Sync error: \(msg)")
+            })
         }
     }
 
@@ -699,6 +774,15 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                         print("sendMessageWithMedia: setAttributes rejected: \(attrError.localizedDescription)")
                     }
                 }
+                // Larger media uploads can legitimately exceed the 30s
+                // text-send timeout. Use 5 minutes here as the outer bound
+                // for "the SDK silently dropped the buildAndSend callback"
+                // — long enough that real slow-network uploads complete,
+                // short enough that a stuck send eventually resolves.
+                let shot = OneShot()
+                shot.arm(seconds: 300) {
+                    completion(TCHResult(), nil, "sendMessageWithMedia timed out after 300s")
+                }
                 builder.addMedia(inputStream: fileInputStream, contentType: mimeType, filename: fileName, listener: MediaMessageListener(
                         onStarted: {
                             print("Media upload started.")
@@ -714,10 +798,13 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                         }
                     ))
                     .buildAndSend(completion: { tchResult, tchMessages in
-                        if tchResult.isSuccessful {
-                            completion(tchResult, tchMessages, nil)
-                        } else {
-                            completion(tchResult, tchMessages, tchResult.resultText)
+                        DispatchQueue.main.async {
+                            guard shot.complete() else { return }
+                            if tchResult.isSuccessful {
+                                completion(tchResult, tchMessages, nil)
+                            } else {
+                                completion(tchResult, tchMessages, tchResult.resultText)
+                            }
                         }
                     })
             }, onFailed: { msg in
@@ -783,29 +870,67 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         }
     }
 
-    func addParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?) -> Void) {
-        self.getConversationFromId(conversationId: conversationId) { conversation in
-            guard let conversation = conversation else {
-                print("Conversation not found for id: \(conversationId)")
-                completion(nil)
+    func addParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?, String?) -> Void) {
+        // Second tuple slot carries a distinct failure reason — timeout or
+        // sync-wait failure must not be confused with a nil status from
+        // an actually-missing conversation. Plugin handler picks the
+        // reason over the nil-result fallback.
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else {
+                completion(nil, "handler released")
                 return
             }
-            conversation.addParticipant(byIdentity: participantName, attributes: nil,completion: { status in
-                completion(status)
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(nil, "Conversation not found for id: \(conversationId)")
+                return
+            }
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                let shot = OneShot()
+                shot.arm(seconds: 30) {
+                    print("addParticipants: timed out after 30s")
+                    completion(nil, "addParticipant timed out after 30s")
+                }
+                conversation.addParticipant(byIdentity: participantName, attributes: nil, completion: { status in
+                    DispatchQueue.main.async {
+                        guard shot.complete() else { return }
+                        completion(status, nil)
+                    }
+                })
+            }, onFailed: { msg in
+                print("addParticipants: sync wait failed: \(msg)")
+                completion(nil, "Sync error: \(msg)")
             })
         }
     }
 
-    func removeParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?) -> Void) {
-        self.getConversationFromId(conversationId: conversationId) { conversation in
-            guard let conversation = conversation else {
-                print("Conversation not found for id: \(conversationId)")
-                completion(nil)
+    func removeParticipants(conversationId:String,participantName:String,_ completion: @escaping(TCHResult?, String?) -> Void) {
+        self.getConversationFromId(conversationId: conversationId) { [weak self] conversation in
+            guard let self = self else {
+                completion(nil, "handler released")
                 return
             }
-            conversation.removeParticipant(byIdentity: participantName,completion: { status in
-                print("status->\(status)")
-                completion(status)
+            guard let conversation = conversation else {
+                print("Conversation not found for id: \(conversationId)")
+                completion(nil, "Conversation not found for id: \(conversationId)")
+                return
+            }
+            self.runWhenConversationSynchronized(conversation, onReady: {
+                let shot = OneShot()
+                shot.arm(seconds: 30) {
+                    print("removeParticipants: timed out after 30s")
+                    completion(nil, "removeParticipant timed out after 30s")
+                }
+                conversation.removeParticipant(byIdentity: participantName, completion: { status in
+                    DispatchQueue.main.async {
+                        guard shot.complete() else { return }
+                        print("status->\(status)")
+                        completion(status, nil)
+                    }
+                })
+            }, onFailed: { msg in
+                print("removeParticipants: sync wait failed: \(msg)")
+                completion(nil, "Sync error: \(msg)")
             })
         }
     }
@@ -1041,10 +1166,24 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             mediaMap["contentType"] = media.contentType
             mediaMap["filename"] = media.filename
 
-            media.getTemporaryContentUrl { result, tempUrl in
-                mediaMap["mediaUrl"] = tempUrl?.absoluteString ?? ""
+            // Per-media watchdog: if Twilio's getTemporaryContentUrl callback
+            // never fires (transport blackhole / mid-shutdown), the
+            // mediaDispatchGroup would never leave and the surrounding
+            // loadPreviousMessages / getLastMessage would hang the Dart
+            // Future indefinitely. Cap at 30s with an empty URL fallback.
+            let shot = OneShot()
+            shot.arm(seconds: 30) {
+                mediaMap["mediaUrl"] = ""
                 attachedMedia.append(mediaMap)
                 mediaDispatchGroup.leave()
+            }
+            media.getTemporaryContentUrl { result, tempUrl in
+                DispatchQueue.main.async {
+                    guard shot.complete() else { return }
+                    mediaMap["mediaUrl"] = tempUrl?.absoluteString ?? ""
+                    attachedMedia.append(mediaMap)
+                    mediaDispatchGroup.leave()
+                }
             }
         }
 
@@ -1095,12 +1234,21 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         
         participantsDispatchGroup.enter()
 
-        
+        // Watchdog: subscribedUser is a Twilio async lookup that can drop
+        // its callback (transport blackhole / mid-shutdown). Without this
+        // guard, the surrounding getLastMessage would never resolve.
+        let shot = OneShot()
+        shot.arm(seconds: 30) {
+            participantsDispatchGroup.leave()
+        }
         participant.subscribedUser { result, users in
-            friendlyIdentity = users?.identity ?? ""
-            friendlyName = users?.friendlyName ?? ""
+            DispatchQueue.main.async {
+                guard shot.complete() else { return }
+                friendlyIdentity = users?.identity ?? ""
+                friendlyName = users?.friendlyName ?? ""
                 participantsDispatchGroup.leave()
             }
+        }
 
         participantsDispatchGroup.notify(queue: .main) {
             dictionary["friendlyIdentity"] = friendlyIdentity
@@ -1195,27 +1343,47 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 return
             }
             self.runWhenConversationSynchronized(conversation, onReady: {
-            conversation.getLastMessages(withCount: UInt(searchCount)) { result, messages in
-                guard result.isSuccessful, let messages = messages else {
-                    let err = result.error?.localizedDescription ?? "unknown"
-                    print("deleteMessageWithSid: getLastMessages failed: \(err)")
-                    completion("getLastMessages error: \(err)")
-                    return
+                // Two watchdogs in sequence: getLastMessages (30s) then
+                // conversation.remove (30s). A single watchdog spanning
+                // both would let a slow getLastMessages consume the
+                // budget and racing the remove timer would risk
+                // reporting "timed out" for a message that was actually
+                // deleted (audit Finding 5).
+                let lookupShot = OneShot()
+                lookupShot.arm(seconds: 30) {
+                    completion("Sync error: deleteMessageWithSid getLastMessages timed out after 30s")
                 }
-                guard let message = messages.first(where: { $0.sid == messageSid }) else {
-                    completion("msg_not_found: SID not in last \(searchCount) messages")
-                    return
-                }
-                conversation.remove(message) { deleteResult in
-                    if deleteResult.isSuccessful {
-                        completion("success")
-                    } else {
-                        let err = deleteResult.error?.localizedDescription ?? "unknown"
-                        print("deleteMessageWithSid: remove failed: \(err)")
-                        completion("delete_failed: \(err)")
+                conversation.getLastMessages(withCount: UInt(searchCount)) { result, messages in
+                    DispatchQueue.main.async {
+                        guard lookupShot.complete() else { return }
+                        guard result.isSuccessful, let messages = messages else {
+                            let err = result.error?.localizedDescription ?? "unknown"
+                            print("deleteMessageWithSid: getLastMessages failed: \(err)")
+                            completion("getLastMessages error: \(err)")
+                            return
+                        }
+                        guard let message = messages.first(where: { $0.sid == messageSid }) else {
+                            completion("msg_not_found: SID not in last \(searchCount) messages")
+                            return
+                        }
+                        let deleteShot = OneShot()
+                        deleteShot.arm(seconds: 30) {
+                            completion("Sync error: deleteMessageWithSid remove timed out after 30s")
+                        }
+                        conversation.remove(message) { deleteResult in
+                            DispatchQueue.main.async {
+                                guard deleteShot.complete() else { return }
+                                if deleteResult.isSuccessful {
+                                    completion("success")
+                                } else {
+                                    let err = deleteResult.error?.localizedDescription ?? "unknown"
+                                    print("deleteMessageWithSid: remove failed: \(err)")
+                                    completion("delete_failed: \(err)")
+                                }
+                            }
+                        }
                     }
                 }
-            }
             }, onFailed: { msg in
                 print("deleteMessageWithSid: sync wait failed: \(msg)")
                 completion("Sync error: \(msg)")
@@ -1311,6 +1479,77 @@ fileprivate final class SyncWaiter {
         timer?.cancel()
         timer = nil
         onFailed(message)
+        return true
+    }
+}
+
+/// One-shot guard for a single SDK callback. Pair `arm` with `complete`
+/// (or rely on the timer to fire `onTimeout` if `complete` never arrives).
+///
+/// Why: Twilio iOS callbacks occasionally drop on the floor (transport
+/// blackhole, mid-shutdown race, deinit ordering). Without a watchdog,
+/// any caller that awaits the completion hangs forever. Pair every
+/// "the SDK promised to call back once" path with `OneShot` so that
+/// either the SDK's callback or our timeout resolves the Dart Future
+/// — never neither.
+///
+/// All state mutation is funneled through .main: `arm` and `complete`
+/// hop the work onto the main queue, so callers may invoke them from
+/// any thread (Twilio delivers some callbacks off-main).
+fileprivate final class OneShot {
+    private var handled = false
+    private var timer: DispatchSourceTimer?
+
+    /// Schedule `onTimeout` to fire on .main after `seconds` unless
+    /// `complete()` is called first. May only be armed once.
+    func arm(seconds: TimeInterval, onTimeout: @escaping () -> Void) {
+        let setup = { [weak self] in
+            guard let self = self else { return }
+            guard self.timer == nil, !self.handled else { return }
+            let t = DispatchSource.makeTimerSource(queue: .main)
+            t.schedule(deadline: .now() + seconds)
+            t.setEventHandler { [weak self] in
+                guard let self = self else { return }
+                if !self.handled {
+                    self.handled = true
+                    self.timer = nil
+                    onTimeout()
+                }
+            }
+            self.timer = t
+            t.resume()
+        }
+        if Thread.isMainThread {
+            setup()
+        } else {
+            DispatchQueue.main.async(execute: setup)
+        }
+    }
+
+    /// Returns true on .main if this is the winning resolution
+    /// (the timeout had not already fired). The caller's success block
+    /// should be wrapped in `if shot.complete() { ... }`.
+    ///
+    /// Always runs synchronously on .main so the caller's branch
+    /// executes before any other main-queue work re-enters.
+    @discardableResult
+    func complete() -> Bool {
+        if Thread.isMainThread {
+            return self.completeOnMain()
+        }
+        var won = false
+        DispatchQueue.main.sync {
+            won = self.completeOnMain()
+        }
+        return won
+    }
+
+    private func completeOnMain() -> Bool {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard !handled else { return false }
+        handled = true
+        timer?.cancel()
+        timer = nil
         return true
     }
 }
