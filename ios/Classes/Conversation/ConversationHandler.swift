@@ -551,7 +551,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
             self.runWhenConversationSynchronized(conversation, onReady: {
                 let builder = conversation.prepareMessage().setBody(messageText)
                 if let attributes = attributes {
-                    var attrError: NSError?
+                    var attrError: TCHError?
                     let attributesObject = TCHJsonAttributes(dictionary: attributes)
                     _ = builder.setAttributes(attributesObject, error: &attrError)
                     if let attrError = attrError {
@@ -899,7 +899,7 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
                 }
                 let builder = conversation.prepareMessage().setBody(messageText)
                 if let attributes = attributes {
-                    var attrError: NSError?
+                    var attrError: TCHError?
                     let attributesObject = TCHJsonAttributes(dictionary: attributes)
                     _ = builder.setAttributes(attributesObject, error: &attrError)
                     if let attrError = attrError {
