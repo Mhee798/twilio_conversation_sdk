@@ -339,7 +339,7 @@ class TwilioConversationSdk {
   /// Returns one of the status strings: `"success"`,
   /// `"msg_not_found: ..."`, `"delete_failed: ..."`,
   /// `"conv_failed: ..."`, `"getLastMessages error: ..."`, or
-  /// `"Sync error: ..."` (Android only — surfaces sync-wait timeout).
+  /// `"Sync error: ..."` (iOS + Android — surfaces sync-wait timeout).
   Future<String?> deleteMessageWithSid({
     required String conversationId,
     required String messageSid,

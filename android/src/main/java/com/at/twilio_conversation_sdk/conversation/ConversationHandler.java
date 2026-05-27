@@ -39,7 +39,6 @@ import java.io.InputStream;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -286,14 +285,18 @@ public class ConversationHandler {
     /// Generate token and authenticate user #
     public static String generateAccessToken(String accountSid, String apiKey, String apiSecret, String identity,
             String serviceSid, String pushSid) {
-        // Reject missing credentials early — apiSecret.getBytes() / Builder
-        // would otherwise NPE.
-        if (accountSid == null || apiKey == null || apiSecret == null) {
+        // Reject missing credentials early — apiSecret.getBytes() / Builder /
+        // ChatGrant setters would otherwise NPE deeper in the JWT lib, where
+        // the exception escapes back through generateAccessToken and the
+        // Flutter handler thread, leaving MethodChannel.Result un-invoked
+        // and the Dart Future hanging forever.
+        if (accountSid == null || apiKey == null || apiSecret == null
+                || identity == null || serviceSid == null || pushSid == null) {
             System.err.println("generateAccessToken: missing credential(s); aborting token build");
             return "";
         }
-        // Create an AccessToken builder
-        System.out.println("admin-" + Arrays.toString(apiSecret.getBytes()));
+        // Removed a debug System.out.println that dumped apiSecret bytes to
+        // logcat — those are trivially decodable back to the signing secret.
         AccessToken.Builder builder = new AccessToken.Builder(accountSid, apiKey, apiSecret.getBytes());
         // Set the identity of the token
         builder.identity(identity);
