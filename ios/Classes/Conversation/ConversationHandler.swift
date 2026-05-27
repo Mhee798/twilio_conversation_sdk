@@ -948,18 +948,19 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
 
     func loginWithAccessToken(_ token: String, completion: @escaping (TCHResult?) -> Void) {
-        // Re-arm the OneShot registry on .main BEFORE the client comes back —
-        // shutdownClient leaves it in a drained state, and the plugin reuses
-        // a single handler instance across logout/login. Without this, every
-        // SDK call in the new session would short-circuit to its timeout
-        // fallback because OneShot.arm's register() would still return false.
-        let resetRegistry = { [weak self] in
+        // Re-arm the OneShot registry AND clear coalesce-state on .main
+        // BEFORE the client comes back. shutdownClient already clears these
+        // on its own, but a token-refresh path may call loginWithAccessToken
+        // without a preceding shutdownClient — defense-in-depth.
+        let resetSessionState = { [weak self] in
             self?.oneShotRegistry.reset()
+            self?.pendingReadIndex.removeAll()
+            self?.pendingReadFlush.removeAll()
         }
         if Thread.isMainThread {
-            resetRegistry()
+            resetSessionState()
         } else {
-            DispatchQueue.main.sync(execute: resetRegistry)
+            DispatchQueue.main.sync(execute: resetSessionState)
         }
         // Set up Twilio Conversations client
         TwilioConversationsClient.conversationsClient(withToken: token,
@@ -1622,6 +1623,22 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         // submitted' or a stale completion on a dead FlutterResult).
         drainSyncWaiters(reason: "client shutdown")
         drainOneShots()
+        // Clear in-flight read-index coalesce state on .main. If a
+        // setLastReadMessageIndex is in flight at shutdown its SDK callback
+        // will never fire (client is gone), so the `finish` closure that
+        // would `pendingReadFlush.remove(sid)` is lost. Without this clear,
+        // every subsequent re-login on the same handler instance would
+        // short-circuit at `pendingReadFlush.contains(sid)` and silently
+        // stop writing read-indexes for the entire next session.
+        let clearReadState = { [weak self] in
+            self?.pendingReadIndex.removeAll()
+            self?.pendingReadFlush.removeAll()
+        }
+        if Thread.isMainThread {
+            clearReadState()
+        } else {
+            DispatchQueue.main.async(execute: clearReadState)
+        }
 
         if let client = self.client {
             // Shutdown the client
@@ -1763,15 +1780,29 @@ fileprivate final class OneShotRegistry {
         }
     }
 
-    /// Re-arm the registry for a fresh client session. Clears the `drained`
-    /// flag so subsequent OneShot.arm calls install timers normally.
+    /// Re-arm the registry for a fresh client session. Invalidates any
+    /// still-armed shots from a prior session (their captured FlutterResults
+    /// belong to a torn-down Dart channel; we MUST fire onTimeout now so
+    /// the live DispatchSourceTimers don't deliver a late "timed out after
+    /// 30s" against a now-resolved Future), then clears the `drained` flag
+    /// so subsequent OneShot.arm calls install timers normally.
+    ///
     /// Called from loginWithAccessToken to support logout → login on the
     /// same handler instance (the plugin reuses one ConversationsHandler
-    /// for the app lifetime).
+    /// for the app lifetime), and to also handle the token-refresh path
+    /// where login is called without a preceding shutdownClient.
     func reset() {
         dispatchPrecondition(condition: .onQueue(.main))
-        drained = false
+        // Invalidate any armed shots from a prior session BEFORE removing
+        // them from the table — orphaning them (remove without invalidate)
+        // would leave their DispatchSourceTimers live with no path to
+        // cancel them later.
+        let snapshot = shots.allObjects
         shots.removeAllObjects()
+        for shot in snapshot {
+            shot.invalidate()
+        }
+        drained = false
     }
 }
 
@@ -1854,8 +1885,16 @@ fileprivate final class OneShot {
     func arm(seconds: TimeInterval, onTimeout: @escaping () -> Void) {
         let setup = { [weak self] in
             guard let self = self else { return }
-            if self.timer != nil || self.handled {
-                print("OneShot.arm() called twice or after complete()/invalidate() — second arm is a silent no-op; caller has lost watchdog coverage")
+            if self.timer != nil {
+                // True double-arm — caller really did call arm() twice.
+                print("OneShot.arm(): double-arm detected; second arm is a silent no-op")
+                return
+            }
+            if self.handled {
+                // Benign race: the SDK callback resolved (or invalidate ran)
+                // before this deferred setup hop reached main. The caller's
+                // success branch already ran via shot.complete(). No timer
+                // needed.
                 return
             }
             // If a drainOneShots has already run since this OneShot was
