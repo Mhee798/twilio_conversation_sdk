@@ -39,6 +39,7 @@ import java.io.InputStream;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -46,7 +47,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -56,12 +59,31 @@ import io.flutter.plugin.common.MethodChannel;
 
 public class ConversationHandler {
     /// Entry point for the Conversations SDK.
-    public static ConversationsClient conversationClient;
-    public static FlutterPlugin.FlutterPluginBinding flutterPluginBinding;
-    private static MessageInterface messageInterface;
-    private static AccessTokenInterface accessTokenInterface;
-    private static ConversationsClient.SynchronizationStatus currentSynchronizationStatus = null;
-    private static ConversationsClient.ConnectionState currentConnectionState = null;
+    //
+    // `volatile` on every static mutable shared with Twilio worker threads:
+    // writers (initializeConversationClient / shutdownClient / detachPluginFromClient
+    // on the platform thread; status callbacks on Twilio worker threads) and
+    // readers (isClientInitialized() from any thread; triggerEvent / token
+    // dispatch from Twilio threads) otherwise have no happens-before edge.
+    // Without volatile a worker can see a stale (cached) value of any of these
+    // fields long after a teardown has run, NPE'ing on flutterPluginBinding or
+    // mis-reporting connection state.
+    public static volatile ConversationsClient conversationClient;
+    public static volatile FlutterPlugin.FlutterPluginBinding flutterPluginBinding;
+    private static volatile MessageInterface messageInterface;
+    private static volatile AccessTokenInterface accessTokenInterface;
+    private static volatile ConversationsClient.SynchronizationStatus currentSynchronizationStatus = null;
+    private static volatile ConversationsClient.ConnectionState currentConnectionState = null;
+    /**
+     * Reference to the {@link ConversationsClientListener} we attach to the
+     * current client in {@link #initializeConversationClient}. Kept so
+     * teardown paths (shutdownClient, detachPluginFromClient, the A18
+     * old-client cleanup in initializeConversationClient) can call
+     * {@code conversationClient.removeListener(...)} explicitly — leaving
+     * the listener attached pins the captured {@code clientInterface}
+     * (plugin instance) across hot-restart, leaking the previous plugin.
+     */
+    private static volatile ConversationsClientListener clientListener;
 
     /**
      * Check if the client is initialized and ready to use
@@ -78,6 +100,46 @@ public class ConversationHandler {
 
     /** Max wait for a conversation to reach ALL before we surface a timeout error. */
     private static final long CONVERSATION_SYNC_TIMEOUT_MS = 30_000L;
+
+    /**
+     * A10: tracks the {@link ConversationListener} attached by
+     * {@link #subscribeToMessageUpdate(String)} per conversation sid so that
+     * (a) re-subscribing doesn't stack duplicate listeners and (b)
+     * {@link #unSubscribeToMessageUpdate(String)} can remove only its own
+     * listener without disturbing in-flight listeners from
+     * {@link #runWhenConversationSynchronized}.
+     */
+    private static final Map<String, ConversationListener> activeMessageListeners =
+            new ConcurrentHashMap<>();
+
+    /** Max wait for updateMessages to finish processing all per-message callbacks. */
+    private static final long UPDATE_MESSAGES_TIMEOUT_MS = 30_000L;
+
+    /**
+     * Clear the per-conversation listener map at client teardown.
+     *
+     * <p>An earlier iteration of this method tried to call
+     * {@code conversation.removeListener(...)} on each entry via an async
+     * {@code conversationClient.getConversation(sid, ...)} lookup, but the
+     * call sites (shutdownClient, initializeConversationClient's previous-
+     * client cleanup) invoke this RIGHT BEFORE {@code conversationClient.shutdown()}
+     * — by the time the async getConversation callback fired, the client was
+     * already shut down and the lookup either failed or returned a dead
+     * Conversation. The "removal" never actually reached Twilio's listener
+     * collection.
+     *
+     * <p>Per Twilio's contract, {@link ConversationsClient#shutdown()} stops
+     * dispatching events from any registered ConversationListener on any
+     * Conversation belonging to that client. So once shutdown() runs, the
+     * listeners can no longer fire — we don't need to explicitly remove them
+     * to stop event delivery. The only reason to detach was to allow
+     * Conversation/Listener Java references to be GC'd; clearing the static
+     * map drops the plugin's hold on the listeners, and the SDK drops the
+     * Conversation references when shutdown completes.
+     */
+    private static void detachAllMessageListeners() {
+        activeMessageListeners.clear();
+    }
 
     /**
      * Sync-failure callback used by {@link #runWhenConversationSynchronized}.
@@ -574,8 +636,19 @@ public class ConversationHandler {
                             public void onSuccess(List<Message> messagesList) {
                                 // ใช้ CountDownLatch เพื่อรอให้ทุก message อัปเดตเสร็จ
                                 CountDownLatch latch = new CountDownLatch(messages.size());
-                                List<String> successList = new ArrayList<>();
-                                List<String> errorList = new ArrayList<>();
+                                // A15: previously plain ArrayList → mutated from
+                                // Twilio worker threads (updateBody / setAttributes
+                                // callbacks) without synchronization, risking
+                                // corrupted internal arrays or lost updates.
+                                List<String> successList = Collections.synchronizedList(new ArrayList<>());
+                                List<String> errorList = Collections.synchronizedList(new ArrayList<>());
+                                // Flipped to true when the awaiter has already replied
+                                // (either via successful latch completion or timeout).
+                                // Per-message callbacks check this and bail without
+                                // touching the lists — so late completions don't
+                                // silently corrupt counts on the awaiter's snapshot,
+                                // and don't race the codec iteration of those lists.
+                                final AtomicBoolean awaiterDone = new AtomicBoolean(false);
 
                                 // วนลูปผ่านแต่ละ message ที่ต้องการอัปเดต
                                 for (HashMap<String, Object> messageData : messages) {
@@ -620,29 +693,36 @@ public class ConversationHandler {
 
                                             final Attributes attributesToSet = finalAttributes;
 
-                                            // ✅ อัปเดต body ก่อน
+                                            // ✅ อัปเดต body ก่อน. Each callback first
+                                            // checks awaiterDone — once the awaiter has
+                                            // replied (latch completed or timed out), any
+                                            // late callback bails without mutating the
+                                            // already-snapshotted lists, matching the
+                                            // contract documented at the declaration site.
                                             targetMessage.updateBody(newBody, new StatusListener() {
                                                 @Override
                                                 public void onSuccess() {
-                                                    // ✅ จากนั้นอัปเดต attributes ต่อ (ถ้ามี)
+                                                    if (awaiterDone.get()) return;
                                                     if (attributesToSet != null) {
                                                         targetMessage.setAttributes(attributesToSet,
                                                                 new StatusListener() {
                                                                     @Override
                                                                     public void onSuccess() {
+                                                                        if (awaiterDone.get()) return;
                                                                         successList.add(msgId);
                                                                         latch.countDown();
                                                                     }
 
                                                                     @Override
                                                                     public void onError(ErrorInfo errorInfo) {
+                                                                        if (awaiterDone.get()) return;
                                                                         errorList.add(msgId + ": setAttributes error - "
                                                                                 + errorInfo.getMessage());
                                                                         latch.countDown();
                                                                     }
                                                                 });
                                                     } else {
-                                                        // ไม่มี attributes ให้ update, ถือว่าสำเร็จ
+                                                        // No attributes — already done.
                                                         successList.add(msgId);
                                                         latch.countDown();
                                                     }
@@ -650,6 +730,7 @@ public class ConversationHandler {
 
                                                 @Override
                                                 public void onError(ErrorInfo errorInfo) {
+                                                    if (awaiterDone.get()) return;
                                                     errorList.add(
                                                             msgId + ": updateBody error - " + errorInfo.getMessage());
                                                     latch.countDown();
@@ -665,40 +746,117 @@ public class ConversationHandler {
                                     }
                                 }
 
-                                // รอให้ทุก message อัปเดตเสร็จ
-                                new Thread(() -> {
+                                // A15: bounded latch await + main-looper reply.
+                                // Previous code used a raw `new Thread(...)` with
+                                // `latch.await()` (no timeout) — if any single
+                                // updateBody/setAttributes callback was dropped
+                                // by Twilio (worker thread died, listener leaked,
+                                // etc.) the latch never reached zero and the
+                                // Flutter Future hung indefinitely. 30s matches
+                                // CONVERSATION_SYNC_TIMEOUT_MS so the user-visible
+                                // upper bound is consistent.
+                                //
+                                // We still spawn a thread because we are inside a
+                                // Twilio worker thread here and must not call
+                                // latch.await() on it (that would block the
+                                // shared worker pool the per-message callbacks
+                                // need to fire on, deadlocking the latch).
+                                Thread awaiter = new Thread(() -> {
+                                    Map<String, Object> responseMap = new HashMap<>();
+                                    // Outer Throwable catch ensures the Dart Future
+                                    // always resolves — without this, an OOM during
+                                    // ArrayList copy, an unexpected RuntimeException in
+                                    // responseMap.put, or any other unchecked failure
+                                    // would kill the awaiter thread silently and the
+                                    // Future would hang forever. That's precisely the
+                                    // A15 failure mode the timeout was meant to fix.
                                     try {
-                                        latch.await();
-                                        // สร้าง response
-                                        Map<String, Object> responseMap = new HashMap<>();
-                                        responseMap.put("success", successList);
-                                        responseMap.put("errors", errorList);
-                                        responseMap.put("totalSuccess", successList.size());
-                                        responseMap.put("totalErrors", errorList.size());
-
-                                        // ส่งผลลัพธ์กลับไปยัง Flutter
-                                        new Handler(Looper.getMainLooper()).post(() -> {
+                                        boolean completed;
+                                        try {
+                                            completed = latch.await(
+                                                    UPDATE_MESSAGES_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                                        } catch (InterruptedException ie) {
+                                            Thread.currentThread().interrupt();
+                                            awaiterDone.set(true);
+                                            responseMap.clear();
+                                            responseMap.put("error", "Thread interrupted: " + ie.getMessage());
                                             result.success(responseMap);
-                                        });
-                                    } catch (InterruptedException e) {
-                                        new Handler(Looper.getMainLooper()).post(() -> {
-                                            Map<String, Object> errorResponse = new HashMap<>();
-                                            errorResponse.put("error", "Thread interrupted: " + e.getMessage());
-                                            result.success(errorResponse);
-                                        });
+                                            return;
+                                        }
+                                        // Defensive snapshot under each list's own
+                                        // monitor — Collections.synchronizedList
+                                        // requires the caller to hold its monitor for
+                                        // any iteration, including the iterator() call
+                                        // the ArrayList copy constructor performs. Set
+                                        // awaiterDone BEFORE the snapshot so any
+                                        // per-message callback that wakes up between
+                                        // the latch release and our snapshot still sees
+                                        // awaiterDone=true and bails (it would only add
+                                        // entries that don't make it into the snapshot
+                                        // anyway, but doing the redundant work is
+                                        // wasteful and the bail is cheap).
+                                        awaiterDone.set(true);
+                                        List<String> successSnapshot;
+                                        List<String> errorSnapshot;
+                                        synchronized (successList) {
+                                            successSnapshot = new ArrayList<>(successList);
+                                        }
+                                        synchronized (errorList) {
+                                            errorSnapshot = new ArrayList<>(errorList);
+                                        }
+                                        responseMap.put("success", successSnapshot);
+                                        responseMap.put("errors", errorSnapshot);
+                                        // totalSuccess / totalErrors reflect REAL per-message
+                                        // outcomes only — the synthetic timeout marker that
+                                        // the previous implementation added to errorList
+                                        // would otherwise inflate totalErrors by 1 on every
+                                        // timeout, misleading the Dart caller into thinking
+                                        // an extra message failed. The timeout signal lives
+                                        // in its own keys.
+                                        responseMap.put("totalSuccess", successSnapshot.size());
+                                        responseMap.put("totalErrors", errorSnapshot.size());
+                                        responseMap.put("timedOut", !completed);
+                                        if (!completed) {
+                                            responseMap.put(
+                                                    "timeoutReason",
+                                                    "updateMessages timed out after "
+                                                            + UPDATE_MESSAGES_TIMEOUT_MS
+                                                            + "ms — partial results returned");
+                                        }
+                                        // No inner Handler.post — MainThreadResult (the
+                                        // wrapping at TwilioConversationSdkPlugin.onMethodCall)
+                                        // already main-thread-dispatches every reply.
+                                        result.success(responseMap);
+                                    } catch (Throwable t) {
+                                        // Last-ditch: avoid leaving the Dart Future
+                                        // hanging on any unchecked failure (OOM,
+                                        // unencodable map value found later by
+                                        // MainThreadResult — though that's caught in
+                                        // the wrapper too, etc.).
+                                        System.err.println(
+                                                "updateMessages awaiter threw: " + t);
+                                        awaiterDone.set(true);
+                                        try {
+                                            result.error(
+                                                    "UPDATE_MESSAGES_AWAITER_DIED",
+                                                    t.getClass().getSimpleName() + ": " + t.getMessage(),
+                                                    null);
+                                        } catch (Throwable t2) {
+                                            System.err.println(
+                                                    "updateMessages awaiter fallback error also threw: " + t2);
+                                        }
                                     }
-                                }).start();
+                                }, "twilio-updateMessages-await");
+                                awaiter.setDaemon(true);
+                                awaiter.start();
                             }
 
                             @Override
                             public void onError(ErrorInfo errorInfo) {
-                                // Mirror the success path's main-looper post so result.success is
-                                // always invoked on the platform thread (Flutter requirement).
-                                new Handler(Looper.getMainLooper()).post(() -> {
-                                    Map<String, Object> errorResponse = new HashMap<>();
-                                    errorResponse.put("error", "getLastMessages error: " + errorInfo.getMessage());
-                                    result.success(errorResponse);
-                                });
+                                // MainThreadResult already dispatches on main looper.
+                                Map<String, Object> errorResponse = new HashMap<>();
+                                errorResponse.put("error", "getLastMessages error: " + errorInfo.getMessage());
+                                result.success(errorResponse);
                             }
                         }),
                         errMsg -> {
@@ -818,6 +976,33 @@ public class ConversationHandler {
             @Override
             public void onSuccess(Conversation conversation) {
                 final AtomicBoolean mediaUploadFailed = new AtomicBoolean(false);
+                // A16: hold the InputStream so we can close it from the
+                // terminal MediaUploadListener callbacks (onCompleted /
+                // onFailed). Previously openInputStream(File) was passed
+                // straight to addMedia and never explicitly closed → fd leak
+                // on every media send. We cannot try-with-resources because
+                // Twilio reads the stream asynchronously after addMedia
+                // returns.
+                final AtomicReference<InputStream> mediaStreamRef = new AtomicReference<>();
+                // Tracks whether addMedia has been called: once it has, the SDK
+                // owns the stream and may still be reading from it on a worker
+                // thread, so neither the catch block nor buildAndSend.onSuccess
+                // is safe to close the stream — only the MediaUploadListener's
+                // terminal callbacks know when the SDK is done. Before addMedia
+                // is called (e.g. an exception thrown by openInputStream or
+                // setAttributes), the stream still belongs to us and the catch
+                // is the right place to close it.
+                final AtomicBoolean addMediaCalled = new AtomicBoolean(false);
+                final Runnable closeMediaStream = () -> {
+                    InputStream s = mediaStreamRef.getAndSet(null);
+                    if (s != null) {
+                        try {
+                            s.close();
+                        } catch (IOException ioe) {
+                            System.err.println("sendMessageWithMedia: stream close threw: " + ioe);
+                        }
+                    }
+                };
                 try {
                     System.out.println("enteredMessage:" + enteredMessage);
                     System.out.println("conversationId:" + conversationId);
@@ -849,10 +1034,12 @@ public class ConversationHandler {
                         }
                         return;
                     }
+                    mediaStreamRef.set(fileInputStream);
                     Conversation.MessageBuilder builder = conversation.prepareMessage().setBody(enteredMessage);
                     if (attributes != null) {
                         builder.setAttributes(attributes);
                     }
+                    addMediaCalled.set(true);
                     builder.addMedia(fileInputStream, mimeType, fileName, new MediaUploadListener() {
                                 @Override
                                 public void onStarted() {
@@ -870,6 +1057,9 @@ public class ConversationHandler {
                                 @Override
                                 public void onCompleted(@NonNull String mediaSid) {
                                     System.out.println("Media uploaded successfully with SID: " + mediaSid);
+                                    // A16: terminal success — stream no longer
+                                    // needed by Twilio.
+                                    closeMediaStream.run();
                                     HashMap<String, Object> progressData = new HashMap<>();
                                     progressData.put("mediaStatus", "Completed");
                                     triggerEvent(progressData);
@@ -879,6 +1069,8 @@ public class ConversationHandler {
                                 public void onFailed(@NonNull ErrorInfo errorInfo) {
                                     // Handle media upload failure
                                     System.err.println("Media upload failed:" + errorInfo.getMessage());
+                                    // A16: terminal failure — release fd.
+                                    closeMediaStream.run();
                                     mediaUploadFailed.set(true);
                                     HashMap<String, Object> progressData = new HashMap<>();
                                     progressData.put("mediaStatus", Strings.failed);
@@ -890,10 +1082,20 @@ public class ConversationHandler {
                             }).buildAndSend(new CallbackListener() {
                                 @Override
                                 public void onSuccess(Object data) {
-                                    // buildAndSend completes after media is
-                                    // uploaded; if media upload failed earlier
-                                    // (onFailed already fired), don't report
-                                    // success.
+                                    // buildAndSend completes when the message envelope
+                                    // is server-acked; if media upload failed earlier
+                                    // (onFailed already fired), don't report success.
+                                    //
+                                    // Do NOT close the InputStream here. Twilio does not
+                                    // contractually guarantee buildAndSend.onSuccess
+                                    // fires AFTER MediaUploadListener.onCompleted —
+                                    // closing here while the media worker is still
+                                    // pumping bytes would truncate the upload silently,
+                                    // and Dart would receive a success reply for a
+                                    // corrupted message. Stream closure is owned by the
+                                    // MediaUploadListener's terminal callbacks
+                                    // (onCompleted / onFailed) which fire exactly when
+                                    // the stream is no longer needed.
                                     System.out.println("Message sent successfully!");
                                     if (mediaUploadFailed.get()) {
                                         return;
@@ -911,8 +1113,16 @@ public class ConversationHandler {
 
                                 @Override
                                 public void onError(ErrorInfo errorInfo) {
-                                    // Handle message send error
+                                    // Handle message send error. Twilio may reject
+                                    // the message envelope BEFORE the media upload
+                                    // starts — in which case MediaUploadListener
+                                    // never fires its terminal callback and the
+                                    // stream would leak. closeMediaStream is
+                                    // idempotent (AtomicReference.getAndSet), so
+                                    // calling it here is safe even if onFailed
+                                    // already fired and closed the stream.
                                     System.err.println("Error sending message: " + errorInfo.getMessage());
+                                    closeMediaStream.run();
                                     HashMap<String, Object> progressData = new HashMap<>();
                                     progressData.put("messageStatus", Strings.failed);
                                     triggerEvent(progressData);
@@ -924,6 +1134,17 @@ public class ConversationHandler {
                 } catch (Exception e) {
                     // Handle exceptions (e.g., JSONException, FileNotFoundException)
                     System.err.println("Error preparing message: " + e.getMessage());
+                    // A16: only close the stream if Twilio has NOT yet taken
+                    // ownership via addMedia — once addMedia has returned, the
+                    // SDK may still be reading from the stream on a worker
+                    // thread (the exception we're handling could have come
+                    // from buildAndSend, which runs AFTER addMedia). Closing
+                    // mid-read would truncate the upload silently while the
+                    // MediaUploadListener still fires onCompleted reporting
+                    // success.
+                    if (!addMediaCalled.get()) {
+                        closeMediaStream.run();
+                    }
                     HashMap<String, Object> progressData = new HashMap<>();
                     progressData.put("messageStatus", Strings.failed);
                     triggerEvent(progressData);
@@ -952,13 +1173,42 @@ public class ConversationHandler {
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation result) {
-                // Join the conversation with the given participant identity
-                result.addListener(new ConversationListener() {
+                // A10: if a previous subscription on this conversation is still
+                // attached, detach it before adding a new one. Re-subscribing
+                // would otherwise stack listeners and fire onMessageAdded N
+                // times for one inbound message.
+                final String sid = result.getSid();
+                final ConversationListener previous = activeMessageListeners.get(sid);
+                if (previous != null) {
+                    try {
+                        result.removeListener(previous);
+                        // Only drop the map entry AFTER a successful removal.
+                        // If removeListener threw, the previous listener is
+                        // still attached on the conversation; we must keep
+                        // the map entry so the next subscribe (or
+                        // unSubscribeToMessageUpdate) can retry the removal.
+                        // Re-attaching a new listener now would create
+                        // duplicates — exactly what A10 was meant to prevent.
+                        activeMessageListeners.remove(sid);
+                    } catch (RuntimeException e) {
+                        System.err.println(
+                                "subscribeToMessageUpdate: removeListener (previous) threw for "
+                                        + sid + "; aborting to avoid duplicate listener: " + e);
+                        return;
+                    }
+                }
+
+                // Build the new listener, register it, then remember it so
+                // unSubscribeToMessageUpdate can detach it specifically
+                // (instead of removeAllListeners(), which would also kill
+                // listeners belonging to in-flight runWhenConversationSynchronized
+                // calls and make their getMessages/etc. time out).
+                ConversationListener listener = new ConversationListener() {
                     @Override
                     public void onMessageAdded(Message message) {
                         // new code for attach media check
                         try {
-                            Map<String, Object> messageMap = new HashMap<>();
+                            final Map<String, Object> messageMap = new HashMap<>();
                             messageMap.put("sid", message.getSid());
                             messageMap.put("author", message.getAuthor());
                             messageMap.put("body", message.getBody());
@@ -966,16 +1216,41 @@ public class ConversationHandler {
                             messageMap.put("dateCreated", message.getDateCreated());
                             messageMap.put("conversationSid", result.getSid());
 
-                            List<Map<String, Object>> mediaList = new ArrayList<>();
-                            int[] pendingMediaCount = { 0 }; // Counter to track pending URL fetches
+                            // A20: synchronizedList so concurrent URL callbacks add safely.
+                            final List<Map<String, Object>> mediaList =
+                                    Collections.synchronizedList(new ArrayList<>());
+                            // A7-analog: pre-arm at 1 + single-fire AtomicBoolean so a
+                            // cached/sync getTemporaryContentUrl callback firing inside
+                            // the loop cannot drive the counter to 0 mid-build and emit
+                            // multiple partial-state triggerEvent calls. The post-loop
+                            // decrement releases the pre-arm.
+                            final int[] pendingMediaCount = { 1 };
+                            final AtomicBoolean delivered = new AtomicBoolean(false);
+                            final Runnable maybeDeliver = () -> {
+                                if (delivered.compareAndSet(false, true)) {
+                                    // Deep-snapshot mediaList — the live
+                                    // synchronizedList may still be mutated
+                                    // by a spurious late getTemporaryContentUrl
+                                    // callback after `delivered` flipped. The
+                                    // codec on the platform thread iterates
+                                    // this without acquiring the monitor; a
+                                    // late add would CME. Match the deep-copy
+                                    // policy used in getAllMessages.replyWithList.
+                                    List<Map<String, Object>> snapshot;
+                                    synchronized (mediaList) {
+                                        snapshot = new ArrayList<>(mediaList);
+                                    }
+                                    messageMap.put("attachMedia", snapshot);
+                                    triggerEvent(messageMap);
+                                }
+                            };
 
                             for (Media media : message.getAttachedMedia()) {
-                                Map<String, Object> mediaMap = new HashMap<>();
+                                final Map<String, Object> mediaMap = new HashMap<>();
                                 mediaMap.put("sid", media.getSid());
                                 mediaMap.put("contentType", media.getContentType());
                                 mediaMap.put("filename", media.getFilename());
 
-                                // Increment pending media count
                                 synchronized (pendingMediaCount) {
                                     pendingMediaCount[0]++;
                                 }
@@ -984,41 +1259,45 @@ public class ConversationHandler {
                                     @Override
                                     public void onSuccess(String mediaUrl) {
                                         mediaMap.put("mediaUrl", mediaUrl);
-                                        mediaList.add(mediaMap);
-
-                                        // Decrement pending media count and check completion
+                                        // A20: mediaList.add + counter decrement in
+                                        // one critical section. Capture the
+                                        // "should-deliver" decision INSIDE the lock
+                                        // but call maybeDeliver OUTSIDE — the
+                                        // delivery path posts to the main looper /
+                                        // may run inline and we don't want to hold
+                                        // the pendingMediaCount monitor while doing
+                                        // unbounded work.
+                                        boolean shouldDeliver;
                                         synchronized (pendingMediaCount) {
+                                            mediaList.add(mediaMap);
                                             pendingMediaCount[0]--;
-                                            if (pendingMediaCount[0] == 0) {
-                                                messageMap.put("attachMedia", mediaList);
-                                                triggerEvent(messageMap); // Trigger event when all URLs are fetched
-                                            }
+                                            shouldDeliver = pendingMediaCount[0] == 0;
                                         }
+                                        if (shouldDeliver) maybeDeliver.run();
                                     }
 
                                     @Override
                                     public void onError(ErrorInfo errorInfo) {
                                         System.err.println("Error retrieving media URL: " + errorInfo.getMessage());
-
-                                        // Decrement pending media count and check completion
+                                        boolean shouldDeliver;
                                         synchronized (pendingMediaCount) {
                                             pendingMediaCount[0]--;
-                                            if (pendingMediaCount[0] == 0) {
-                                                messageMap.put("attachMedia", mediaList);
-                                                triggerEvent(messageMap); // Trigger event even if there are errors
-                                            }
+                                            shouldDeliver = pendingMediaCount[0] == 0;
                                         }
+                                        if (shouldDeliver) maybeDeliver.run();
                                     }
                                 });
                             }
 
-                            // If no media to fetch, trigger the event immediately
+                            // Release the +1 pre-arm. If every media URL has already
+                            // resolved synchronously this is the trigger that delivers
+                            // the event; otherwise the last pending callback fires it.
+                            boolean shouldDeliver;
                             synchronized (pendingMediaCount) {
-                                if (pendingMediaCount[0] == 0) {
-                                    messageMap.put("attachMedia", mediaList);
-                                    triggerEvent(messageMap);
-                                }
+                                pendingMediaCount[0]--;
+                                shouldDeliver = pendingMediaCount[0] == 0;
                             }
+                            if (shouldDeliver) maybeDeliver.run();
 
                             // Update the last read message index
                             result.setLastReadMessageIndex(result.getLastMessageIndex() + 1,
@@ -1026,6 +1305,13 @@ public class ConversationHandler {
                                         @Override
                                         public void onSuccess(Long result) {
                                             System.out.println("LastReadMessageIndex- " + result);
+                                        }
+
+                                        @Override
+                                        public void onError(ErrorInfo errorInfo) {
+                                            System.err.println(
+                                                    "setLastReadMessageIndex (onMessageAdded) failed: "
+                                                            + errorInfo.getMessage());
                                         }
                                     });
 
@@ -1042,7 +1328,7 @@ public class ConversationHandler {
                         System.out.println("onMessageUpdated->" + message.toString());
                         System.out.println("reason->" + reason.toString());
                         try {
-                            Map<String, Object> messageMap = new HashMap<>();
+                            final Map<String, Object> messageMap = new HashMap<>();
                             messageMap.put("sid", message.getSid());
                             messageMap.put("author", message.getAuthor());
                             messageMap.put("body", message.getBody());
@@ -1050,16 +1336,32 @@ public class ConversationHandler {
                             messageMap.put("dateCreated", message.getDateCreated());
                             messageMap.put("conversationSid", result.getSid());
 
-                            List<Map<String, Object>> mediaList = new ArrayList<>();
-                            int[] pendingMediaCount = { 0 }; // Counter to track pending URL fetches
+                            // A7-analog + A20: same pattern as onMessageAdded
+                            // (pre-arm counter + AtomicBoolean single-fire +
+                            // mediaList.add inside the synchronized block +
+                            // deep-snapshot mediaList in maybeDeliver to
+                            // avoid CME on a late callback).
+                            final List<Map<String, Object>> mediaList =
+                                    Collections.synchronizedList(new ArrayList<>());
+                            final int[] pendingMediaCount = { 1 };
+                            final AtomicBoolean delivered = new AtomicBoolean(false);
+                            final Runnable maybeDeliver = () -> {
+                                if (delivered.compareAndSet(false, true)) {
+                                    List<Map<String, Object>> snapshot;
+                                    synchronized (mediaList) {
+                                        snapshot = new ArrayList<>(mediaList);
+                                    }
+                                    messageMap.put("attachMedia", snapshot);
+                                    triggerEvent(messageMap);
+                                }
+                            };
 
                             for (Media media : message.getAttachedMedia()) {
-                                Map<String, Object> mediaMap = new HashMap<>();
+                                final Map<String, Object> mediaMap = new HashMap<>();
                                 mediaMap.put("sid", media.getSid());
                                 mediaMap.put("contentType", media.getContentType());
                                 mediaMap.put("filename", media.getFilename());
 
-                                // Increment pending media count
                                 synchronized (pendingMediaCount) {
                                     pendingMediaCount[0]++;
                                 }
@@ -1068,41 +1370,35 @@ public class ConversationHandler {
                                     @Override
                                     public void onSuccess(String mediaUrl) {
                                         mediaMap.put("mediaUrl", mediaUrl);
-                                        mediaList.add(mediaMap);
-
-                                        // Decrement pending media count and check completion
+                                        boolean shouldDeliver;
                                         synchronized (pendingMediaCount) {
+                                            mediaList.add(mediaMap);
                                             pendingMediaCount[0]--;
-                                            if (pendingMediaCount[0] == 0) {
-                                                messageMap.put("attachMedia", mediaList);
-                                                triggerEvent(messageMap); // Trigger event when all URLs are fetched
-                                            }
+                                            shouldDeliver = pendingMediaCount[0] == 0;
                                         }
+                                        if (shouldDeliver) maybeDeliver.run();
                                     }
 
                                     @Override
                                     public void onError(ErrorInfo errorInfo) {
                                         System.err.println("Error retrieving media URL: " + errorInfo.getMessage());
-
-                                        // Decrement pending media count and check completion
+                                        boolean shouldDeliver;
                                         synchronized (pendingMediaCount) {
                                             pendingMediaCount[0]--;
-                                            if (pendingMediaCount[0] == 0) {
-                                                messageMap.put("attachMedia", mediaList);
-                                                triggerEvent(messageMap); // Trigger event even if there are errors
-                                            }
+                                            shouldDeliver = pendingMediaCount[0] == 0;
                                         }
+                                        if (shouldDeliver) maybeDeliver.run();
                                     }
                                 });
                             }
 
-                            // If no media to fetch, trigger the event immediately
+                            // Release the +1 pre-arm.
+                            boolean shouldDeliver;
                             synchronized (pendingMediaCount) {
-                                if (pendingMediaCount[0] == 0) {
-                                    messageMap.put("attachMedia", mediaList);
-                                    triggerEvent(messageMap);
-                                }
+                                pendingMediaCount[0]--;
+                                shouldDeliver = pendingMediaCount[0] == 0;
                             }
+                            if (shouldDeliver) maybeDeliver.run();
 
                             // Update the last read message index
                             result.setLastReadMessageIndex(result.getLastMessageIndex() + 1,
@@ -1110,6 +1406,13 @@ public class ConversationHandler {
                                         @Override
                                         public void onSuccess(Long result) {
                                             System.out.println("LastReadMessageIndex- " + result);
+                                        }
+
+                                        @Override
+                                        public void onError(ErrorInfo errorInfo) {
+                                            System.err.println(
+                                                    "setLastReadMessageIndex (onMessageUpdated) failed: "
+                                                            + errorInfo.getMessage());
                                         }
                                     });
 
@@ -1169,7 +1472,32 @@ public class ConversationHandler {
                             messageInterface.onSynchronizationChanged(syncMap);
                         }
                     }
-                });
+                };
+                boolean attached = false;
+                try {
+                    result.addListener(listener);
+                    attached = true;
+                    activeMessageListeners.put(sid, listener);
+                } catch (RuntimeException e) {
+                    System.err.println("subscribeToMessageUpdate: addListener threw for "
+                            + sid + ": " + e);
+                    // Best-effort cleanup: Twilio may have partially registered the
+                    // listener before throwing. removeListener is idempotent (Twilio's
+                    // implementation no-ops if the listener isn't found), so this is
+                    // safe whether the listener was actually attached or not, and
+                    // prevents an orphaned listener from firing into Dart forever.
+                    try {
+                        result.removeListener(listener);
+                    } catch (RuntimeException re) {
+                        System.err.println(
+                                "subscribeToMessageUpdate: cleanup removeListener threw for "
+                                        + sid + ": " + re);
+                    }
+                }
+                if (!attached) {
+                    // Make sure no stale entry remains keyed by sid.
+                    activeMessageListeners.remove(sid);
+                }
             }
 
             @Override
@@ -1211,8 +1539,31 @@ public class ConversationHandler {
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation result) {
-                /// Retrieve the conversation object using the conversation SID
-                result.removeAllListeners();
+                // A10: remove only the listener that subscribeToMessageUpdate
+                // installed for this conversation. The previous code called
+                // removeAllListeners(), which also detached listeners owned by
+                // in-flight runWhenConversationSynchronized calls (body /
+                // updateMessages / sendMessageWithMedia / etc.), causing those
+                // callers to time out instead of complete.
+                final String sid = result.getSid();
+                final ConversationListener listener = activeMessageListeners.get(sid);
+                if (listener != null) {
+                    try {
+                        result.removeListener(listener);
+                        // Symmetric with subscribeToMessageUpdate: only drop
+                        // the map entry AFTER a successful removeListener.
+                        // If removeListener threw, the listener is still
+                        // attached on Twilio's side — keeping the map entry
+                        // lets a subsequent unSubscribeToMessageUpdate (or
+                        // subscribe's pre-attach cleanup) retry the removal.
+                        // Dropping the entry preemptively would orphan the
+                        // listener: no future call could find and remove it.
+                        activeMessageListeners.remove(sid);
+                    } catch (RuntimeException e) {
+                        System.err.println("unSubscribeToMessageUpdate: removeListener threw for "
+                                + sid + "; leaving map entry for retry: " + e);
+                    }
+                }
             }
 
             @Override
@@ -1270,7 +1621,14 @@ public class ConversationHandler {
             return;
         }
 
-        List<Map<String, Object>> list = new ArrayList<>();
+        // A9: Collections.synchronizedList — the entries are added on whichever
+        // thread Twilio's callback fires on (which is not always the main
+        // thread for cached objects), and we read it from the maybeReply path.
+        List<Map<String, Object>> list = Collections.synchronizedList(new ArrayList<>());
+        // A9: single-fire guard so any combination of paths (sync onError +
+        // late onSuccess, double-fired upstream callback, …) replies at most
+        // once — Flutter throws "Reply already submitted" otherwise.
+        final AtomicBoolean replied = new AtomicBoolean(false);
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
@@ -1291,32 +1649,6 @@ public class ConversationHandler {
                                     conversationMap.put("isGroup", conversation.getParticipantsList().size() > 2);
                                     conversationMap.put("lastReadIndex", conversation.getLastReadMessageIndex());
                                     conversationMap.put("lastMessageIndex", conversation.getLastMessageIndex());
-                                    Participant participant = lastMessage.getParticipant();
-                                    if (participant != null) { // Added null check here
-                                        pendingCallbacks.incrementAndGet();
-                                        participant.getAndSubscribeUser(new CallbackListener<User>() {
-                                            @Override
-                                            public void onSuccess(User user) {
-                                                conversationMap.put("friendlyIdentity", user.getIdentity());
-                                                conversationMap.put("friendlyName", user.getFriendlyName());
-                                                if (pendingCallbacks.decrementAndGet() == 0) {
-                                                    result.success(list);
-                                                }
-                                            }
-
-                                            @Override
-                                            public void onError(ErrorInfo errorInfo) {
-                                                // Without this override the default CallbackListener.onError
-                                                // just logs, pendingCallbacks never decrements, and the
-                                                // Flutter Future hangs forever.
-                                                System.err.println(
-                                                        "getAndSubscribeUser failed: " + errorInfo.getMessage());
-                                                if (pendingCallbacks.decrementAndGet() == 0) {
-                                                    result.success(list);
-                                                }
-                                            }
-                                        });
-                                    }
 
                                     if (conversation.getLastMessageDate() != null) {
                                         SimpleDateFormat inputFormat = new SimpleDateFormat(
@@ -1333,9 +1665,47 @@ public class ConversationHandler {
                                         }
                                     }
 
+                                    // A9: add conversationMap to the result list
+                                    // BEFORE dispatching getAndSubscribeUser.
+                                    // Previously the add happened after the
+                                    // async call; if Twilio resolved the user
+                                    // synchronously (cached) the callback's
+                                    // decrementAndGet could reach 0 while the
+                                    // list was still empty, returning [] to
+                                    // Flutter.
                                     list.add(conversationMap);
+
+                                    Participant participant = lastMessage.getParticipant();
+                                    if (participant != null) { // Added null check here
+                                        pendingCallbacks.incrementAndGet();
+                                        participant.getAndSubscribeUser(new CallbackListener<User>() {
+                                            @Override
+                                            public void onSuccess(User user) {
+                                                conversationMap.put("friendlyIdentity", user.getIdentity());
+                                                conversationMap.put("friendlyName", user.getFriendlyName());
+                                                if (pendingCallbacks.decrementAndGet() == 0
+                                                        && replied.compareAndSet(false, true)) {
+                                                    result.success(list);
+                                                }
+                                            }
+
+                                            @Override
+                                            public void onError(ErrorInfo errorInfo) {
+                                                // Without this override the default CallbackListener.onError
+                                                // just logs, pendingCallbacks never decrements, and the
+                                                // Flutter Future hangs forever.
+                                                System.err.println(
+                                                        "getAndSubscribeUser failed: " + errorInfo.getMessage());
+                                                if (pendingCallbacks.decrementAndGet() == 0
+                                                        && replied.compareAndSet(false, true)) {
+                                                    result.success(list);
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
-                                if (pendingCallbacks.decrementAndGet() == 0) {
+                                if (pendingCallbacks.decrementAndGet() == 0
+                                        && replied.compareAndSet(false, true)) {
                                     result.success(list);
                                 }
                             }
@@ -1343,27 +1713,37 @@ public class ConversationHandler {
                             @Override
                             public void onError(ErrorInfo errorInfo) {
                                 System.out.println("Error fetching last message: " + errorInfo.getMessage());
+                                // Guard list.add behind the replied CAS so a late onError
+                                // arriving AFTER replied=true cannot mutate the list while
+                                // Flutter's StandardMessageCodec iterates it on the main
+                                // thread (would throw ConcurrentModificationException).
+                                if (replied.compareAndSet(false, true)) {
+                                    Map<String, Object> messagesMap = new HashMap<>();
+                                    messagesMap.put("status", "failed");
+                                    list.add(messagesMap);
+                                    result.success(list);
+                                }
+                            }
+                        }),
+                        errMsg -> {
+                            if (replied.compareAndSet(false, true)) {
                                 Map<String, Object> messagesMap = new HashMap<>();
                                 messagesMap.put("status", "failed");
                                 list.add(messagesMap);
                                 result.success(list);
                             }
-                        }),
-                        errMsg -> {
-                            Map<String, Object> messagesMap = new HashMap<>();
-                            messagesMap.put("status", "failed");
-                            list.add(messagesMap);
-                            result.success(list);
                         });
             }
 
             @Override
             public void onError(ErrorInfo errorInfo) {
                 System.out.println("Error fetching conversation: " + errorInfo.getMessage());
-                Map<String, Object> messagesMap = new HashMap<>();
-                messagesMap.put("status", "failed");
-                list.add(messagesMap);
-                result.success(list);
+                if (replied.compareAndSet(false, true)) {
+                    Map<String, Object> messagesMap = new HashMap<>();
+                    messagesMap.put("status", "failed");
+                    list.add(messagesMap);
+                    result.success(list);
+                }
             }
         });
     }
@@ -1423,7 +1803,59 @@ public class ConversationHandler {
             return;
         }
 
-        List<Map<String, Object>> list = new ArrayList<>();
+        // List + reply guard hoisted to the outermost scope so EVERY terminal
+        // branch (onSuccess, the three onError branches, the sync-failed
+        // lambda, and the outer getConversation.onError) shares the same
+        // single-fire AtomicBoolean. Previously `replied` was local to the
+        // inner onSuccess only and the error branches called result.success
+        // directly — if Twilio fired onSuccess then a late onError, Flutter
+        // threw "Reply already submitted" and the error reply was swallowed
+        // (MainThreadResult catches RuntimeException so no crash, but Dart
+        // could see either response depending on dispatch order).
+        final List<Map<String, Object>> list =
+                Collections.synchronizedList(new ArrayList<>());
+        final AtomicBoolean replied = new AtomicBoolean(false);
+        final Runnable replyWithList = () -> {
+            if (replied.compareAndSet(false, true)) {
+                // Defensive DEEP snapshot. A shallow new ArrayList<>(list)
+                // copies the outer list, but each entry's `attachMedia` is the
+                // SAME synchronizedList instance the worker callbacks mutate.
+                // If Twilio mis-fires a media callback after pendingMediaCount
+                // already hit 0, the late mediaList.add races with the codec
+                // iterating the same mediaList on the platform thread →
+                // ConcurrentModificationException. Deep-copy each entry's
+                // mediaList into a plain ArrayList so the codec sees a stable
+                // structure even if a worker mutates the original.
+                List<Map<String, Object>> snapshot;
+                synchronized (list) {
+                    snapshot = new ArrayList<>(list.size());
+                    for (Map<String, Object> entry : list) {
+                        Map<String, Object> entryCopy = new HashMap<>(entry);
+                        Object media = entryCopy.get("attachMedia");
+                        if (media instanceof List<?>) {
+                            List<?> liveMedia = (List<?>) media;
+                            List<Object> mediaCopy;
+                            synchronized (liveMedia) {
+                                mediaCopy = new ArrayList<>(liveMedia);
+                            }
+                            entryCopy.put("attachMedia", mediaCopy);
+                        }
+                        snapshot.add(entryCopy);
+                    }
+                }
+                result.success(snapshot);
+            }
+        };
+        final Runnable replyFailed = () -> {
+            if (replied.compareAndSet(false, true)) {
+                List<Map<String, Object>> failed = new ArrayList<>();
+                Map<String, Object> messagesMap = new HashMap<>();
+                messagesMap.put("status", Strings.failed);
+                failed.add(messagesMap);
+                result.success(failed);
+            }
+        };
+
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
@@ -1432,10 +1864,15 @@ public class ConversationHandler {
                                 new CallbackListener<List<Message>>() {
                                     @Override
                                     public void onSuccess(List<Message> messagesList) {
-                                        int[] pendingMediaCount = { 0 }; // Counter for pending media URL fetches
+                                        // A7: pre-arm the counter at 1 so any
+                                        // synchronous callback during the loop
+                                        // can decrement freely without reaching
+                                        // 0 prematurely. We balance the +1 with
+                                        // an explicit decrement after the loop.
+                                        final int[] pendingMediaCount = { 1 };
 
                                         for (Message message : messagesList) {
-                                            Map<String, Object> messagesMap = new HashMap<>();
+                                            final Map<String, Object> messagesMap = new HashMap<>();
                                             messagesMap.put("sid", message.getSid());
                                             messagesMap.put("author", message.getAuthor());
                                             messagesMap.put("body", message.getBody());
@@ -1443,10 +1880,13 @@ public class ConversationHandler {
                                             messagesMap.put("dateCreated", message.getDateCreated());
                                             messagesMap.put("conversationSid", conversationId);
 
-                                            List<Map<String, Object>> mediaList = new ArrayList<>();
+                                            // A20-analog: Collections.synchronizedList so
+                                            // concurrent media-URL callbacks can safely add.
+                                            final List<Map<String, Object>> mediaList =
+                                                    Collections.synchronizedList(new ArrayList<>());
 
                                             for (Media media : message.getAttachedMedia()) {
-                                                Map<String, Object> mediaMap = new HashMap<>();
+                                                final Map<String, Object> mediaMap = new HashMap<>();
                                                 mediaMap.put("sid", media.getSid());
                                                 mediaMap.put("contentType", media.getContentType());
                                                 mediaMap.put("filename", media.getFilename());
@@ -1461,83 +1901,92 @@ public class ConversationHandler {
                                                     public void onSuccess(String mediaUrl) {
                                                         mediaMap.put("mediaUrl", mediaUrl);
 
-                                                        // Decrement the pending media counter
+                                                        // A20: mediaList.add belongs INSIDE the
+                                                        // same critical section as the counter
+                                                        // decrement so the visibility of mediaUrl
+                                                        // (worker thread put) is published before
+                                                        // any replyWithList reads mediaList.
+                                                        // Move the reply OUTSIDE the lock so we
+                                                        // don't hold pendingMediaCount while the
+                                                        // codec / Handler.post takes its own locks.
+                                                        boolean shouldReply;
                                                         synchronized (pendingMediaCount) {
+                                                            mediaList.add(mediaMap);
                                                             pendingMediaCount[0]--;
-                                                            if (pendingMediaCount[0] == 0) {
-                                                                result.success(list); // All media URLs fetched
-                                                            }
+                                                            shouldReply = pendingMediaCount[0] == 0;
                                                         }
+                                                        if (shouldReply) replyWithList.run();
                                                     }
 
                                                     @Override
                                                     public void onError(ErrorInfo errorInfo) {
                                                         System.err.println("Error retrieving media URL: "
                                                                 + errorInfo.getMessage());
-
-                                                        // Decrement the pending media counter
+                                                        boolean shouldReply;
                                                         synchronized (pendingMediaCount) {
                                                             pendingMediaCount[0]--;
-                                                            if (pendingMediaCount[0] == 0) {
-                                                                result.success(list); // All media URLs fetched
-                                                            }
+                                                            shouldReply = pendingMediaCount[0] == 0;
                                                         }
+                                                        if (shouldReply) replyWithList.run();
                                                     }
                                                 });
-
-                                                mediaList.add(mediaMap);
                                             }
 
                                             messagesMap.put("attachMedia", mediaList);
                                             list.add(messagesMap);
-                                            if (!list.isEmpty()) {
-                                                conversation.setLastReadMessageIndex(conversation.getLastMessageIndex(),
+                                        }
+
+                                        // A8: setLastReadMessageIndex was previously
+                                        // invoked once per message inside the loop —
+                                        // N round-trips to Twilio for the same final
+                                        // value. Issue it exactly once with the last
+                                        // message index after the loop completes.
+                                        if (!list.isEmpty()) {
+                                            try {
+                                                conversation.setLastReadMessageIndex(
+                                                        conversation.getLastMessageIndex(),
                                                         new CallbackListener<Long>() {
                                                             @Override
                                                             public void onSuccess(Long result) {
+                                                            }
 
+                                                            @Override
+                                                            public void onError(ErrorInfo errorInfo) {
+                                                                System.err.println(
+                                                                        "getAllMessages: setLastReadMessageIndex failed: "
+                                                                                + errorInfo.getMessage());
                                                             }
                                                         });
+                                            } catch (RuntimeException e) {
+                                                System.err.println(
+                                                        "getAllMessages: setLastReadMessageIndex threw: " + e);
                                             }
                                         }
 
-                                        // Check if there are no pending media URLs
+                                        // Release the +1 from pre-arm outside the
+                                        // synchronized block (same reason as the
+                                        // per-media callbacks above).
+                                        boolean shouldReply;
                                         synchronized (pendingMediaCount) {
-                                            if (pendingMediaCount[0] == 0) {
-                                                result.success(list);
-                                            }
+                                            pendingMediaCount[0]--;
+                                            shouldReply = pendingMediaCount[0] == 0;
                                         }
+                                        if (shouldReply) replyWithList.run();
                                     }
 
                                     @Override
                                     public void onError(ErrorInfo errorInfo) {
                                         System.err.println("Error retrieving get messages: " + errorInfo.getMessage());
-                                        List<Map<String, Object>> list = new ArrayList<>();
-                                        Map<String, Object> messagesMap = new HashMap<>();
-                                        messagesMap.put("status", Strings.failed);
-                                        list.add(messagesMap);
-                                        result.success(list);
-                                        // result.error("MESSAGE_RETRIEVAL_ERROR", errorInfo.getMessage(), null);
+                                        replyFailed.run();
                                     }
                                 }),
-                                errMsg -> {
-                                    List<Map<String, Object>> errList = new ArrayList<>();
-                                    Map<String, Object> messagesMap = new HashMap<>();
-                                    messagesMap.put("status", Strings.failed);
-                                    errList.add(messagesMap);
-                                    result.success(errList);
-                                });
+                                errMsg -> replyFailed.run());
             }
 
             @Override
             public void onError(ErrorInfo errorInfo) {
                 System.err.println("Error retrieving conversation: " + errorInfo.getMessage());
-                List<Map<String, Object>> list = new ArrayList<>();
-                Map<String, Object> messagesMap = new HashMap<>();
-                messagesMap.put("status", Strings.failed);
-                list.add(messagesMap);
-                result.success(list);
-                // result.error("CONVERSATION_RETRIEVAL_ERROR", errorInfo.getMessage(), null);
+                replyFailed.run();
             }
         });
     }
@@ -1693,13 +2142,77 @@ public class ConversationHandler {
 
     public static void initializeConversationClient(String accessToken, MethodChannel.Result result,
             ClientInterface clientInterface) {
+        // A18: shut down the previous client (if any) before creating a fresh
+        // one. Otherwise its ConversationsClientListener stays attached and
+        // continues to fire onTokenExpired / onClientSynchronization on the
+        // stale connection, producing duplicate events to Dart.
+        if (conversationClient != null) {
+            // Remove our listener first so its closure (which captures the
+            // previous call's clientInterface) becomes eligible for GC. Doing
+            // this BEFORE shutdown() also stops late callbacks fired during
+            // the async shutdown from reaching a dead engine.
+            ConversationsClient prevClient = conversationClient;
+            ConversationsClientListener prevListener = clientListener;
+            if (prevListener != null) {
+                try {
+                    prevClient.removeListener(prevListener);
+                } catch (RuntimeException e) {
+                    System.err.println(
+                            "initializeConversationClient: previous removeListener threw: " + e);
+                }
+                clientListener = null;
+            }
+            try {
+                prevClient.shutdown();
+            } catch (RuntimeException e) {
+                System.err.println("initializeConversationClient: previous shutdown threw: " + e);
+            }
+            // Drop the per-conversation listener map. Twilio's shutdown()
+            // (called just above on prevClient) stops dispatching from any
+            // listener attached to that client's Conversations, so we don't
+            // need to explicitly removeListener on each entry — clearing the
+            // map releases the plugin's hold on the listener instances.
+            detachAllMessageListeners();
+            conversationClient = null;
+            currentSynchronizationStatus = null;
+            currentConnectionState = null;
+        }
+
+        // Capture binding reference once. flutterPluginBinding may be nulled
+        // concurrently by detachPluginFromClient on the platform thread; we
+        // need a stable non-null reference for the SDK call.
+        FlutterPlugin.FlutterPluginBinding binding = flutterPluginBinding;
+        if (binding == null) {
+            System.err.println(
+                    "initializeConversationClient: flutterPluginBinding is null (engine detached?)");
+            result.success(Strings.authenticationFailed);
+            return;
+        }
+
         ConversationsClient.Properties props = ConversationsClient.Properties.newBuilder().createProperties();
-        ConversationsClient.create(flutterPluginBinding.getApplicationContext(), accessToken, props,
+        ConversationsClient.create(binding.getApplicationContext(), accessToken, props,
                 new CallbackListener<ConversationsClient>() {
                     @Override
                     public void onSuccess(ConversationsClient client) {
-                        conversationClient = client;
-                        conversationClient.addListener(new ConversationsClientListener() {
+                        // If the engine detached while create() was in flight,
+                        // do NOT attach a listener whose closure captures the
+                        // now-stale clientInterface (the detached plugin). Just
+                        // shutdown the freshly-created client and bail. We use
+                        // the same flutterPluginBinding-null check that
+                        // detachPluginFromClient performs.
+                        if (flutterPluginBinding == null) {
+                            System.err.println(
+                                    "initializeConversationClient: engine detached during create — shutting down new client");
+                            try {
+                                client.shutdown();
+                            } catch (RuntimeException e) {
+                                System.err.println(
+                                        "initializeConversationClient: detach-during-create shutdown threw: " + e);
+                            }
+                            result.success(Strings.authenticationFailed);
+                            return;
+                        }
+                        ConversationsClientListener listener = new ConversationsClientListener() {
 
                             @Override
                             public void onConversationAdded(Conversation conversation) {
@@ -1808,7 +2321,19 @@ public class ConversationHandler {
                                 tokenStatusMap.put("message", Strings.accessTokenWillExpire);
                                 onTokenStatusChange(tokenStatusMap);
                             }
-                        });
+                        };
+                        // Publish in a safe order: attach the listener to the
+                        // new client FIRST, then publish the field references.
+                        // A concurrent reader (e.g. shutdownClient on the
+                        // platform thread) that observes the new conversationClient
+                        // will also observe a fully-installed listener — never
+                        // a half-attached one. Publishing client BEFORE
+                        // addListener would let a teardown find a non-null
+                        // client whose listener is not yet attached, then
+                        // miss the upcoming addListener completely and leak it.
+                        client.addListener(listener);
+                        clientListener = listener;
+                        conversationClient = client;
                         result.success(Strings.authenticationSuccessful);
                     }
 
@@ -1967,12 +2492,98 @@ public class ConversationHandler {
     }
 
     /**
+     * A19: drop the previous plugin's hold on the Twilio SDK on engine detach
+     * (Flutter hot-restart, plugin teardown) WITHOUT shutting down the
+     * client. Hot-restart detaches and reattaches the engine without the user
+     * intending to log out, so killing the client here would force the user
+     * to re-authenticate every restart — exactly what the calling-site
+     * comment in TwilioConversationSdkPlugin.onDetachedFromEngine forbids.
+     *
+     * <p>What this does:
+     * <ul>
+     *   <li>Removes our ConversationsClientListener (which captures the
+     *       previous plugin instance as {@code clientInterface}) so the old
+     *       plugin can be garbage collected.</li>
+     *   <li>Clears the {@link MessageInterface} / {@link AccessTokenInterface}
+     *       reference IFF it still points at the detaching plugin — a new
+     *       onAttachedToEngine on a fresh plugin instance will overwrite
+     *       these via {@link #setListener} / {@link #setTokenListener}, but
+     *       if the new plugin hasn't attached yet we don't want a stale
+     *       worker-thread callback firing into the dead one.</li>
+     *   <li>Drops the FlutterPluginBinding reference so the old engine's
+     *       Application context is not pinned indefinitely.</li>
+     * </ul>
+     *
+     * <p>Authoritative client teardown remains the Dart-driven
+     * {@link #shutdownClient} path.
+     *
+     * @param detachingPlugin the plugin instance being detached; statics that
+     *                        still point at it are nulled, statics that
+     *                        already point at a newer instance are left alone
+     */
+    public static void detachPluginFromClient(
+            Object detachingPlugin, FlutterPlugin.FlutterPluginBinding detachingBinding) {
+        ConversationsClientListener listener = clientListener;
+        if (listener != null) {
+            // Try to detach from the live client if there is one — if not,
+            // there's no SDK reference to remove, but we still need to null
+            // the static so the listener's closure (which captures the old
+            // plugin via clientInterface) becomes GC-eligible.
+            if (conversationClient != null) {
+                try {
+                    conversationClient.removeListener(listener);
+                } catch (RuntimeException e) {
+                    System.err.println("detachPluginFromClient: removeListener threw: " + e);
+                }
+            }
+            clientListener = null;
+        }
+
+        // Identity-compare so a hot-restart where the new plugin has already
+        // re-registered itself doesn't get its interfaces nulled out from
+        // under it. setListener / setTokenListener / onAttachedToEngine fire
+        // synchronously on the platform thread but the order of detach-vs-
+        // attach across two engines is not contractually guaranteed.
+        if (messageInterface == detachingPlugin) {
+            messageInterface = null;
+        }
+        if (accessTokenInterface == detachingPlugin) {
+            accessTokenInterface = null;
+        }
+        // Same identity check on the binding — previously this was nulled
+        // unconditionally, which would wipe a new engine's binding if it
+        // attached before the old engine detached, causing the next
+        // initializeConversationClient call to fail authentication.
+        if (detachingBinding != null && flutterPluginBinding == detachingBinding) {
+            flutterPluginBinding = null;
+        }
+    }
+
+    /**
      * Shutdown and clean up the Twilio Conversations Client
      * This will properly dispose of the client and free up resources
      */
     public static void shutdownClient(MethodChannel.Result result) {
         try {
             if (conversationClient != null) {
+                // Remove our ConversationsClientListener before shutdown so its
+                // captured clientInterface (plugin instance) is GC-able and so
+                // any late callbacks fired during the async shutdown don't
+                // reach a now-disconnected Dart-side listener.
+                ConversationsClientListener listener = clientListener;
+                if (listener != null) {
+                    try {
+                        conversationClient.removeListener(listener);
+                    } catch (RuntimeException e) {
+                        System.err.println("shutdownClient: removeListener threw: " + e);
+                    }
+                    clientListener = null;
+                }
+                // Drop the per-conversation listener map. shutdown() below
+                // stops Twilio from dispatching any further events on this
+                // client's Conversations, so we just need to release the
+                // plugin's references to the listener instances.
+                detachAllMessageListeners();
                 // Shutdown the client
                 conversationClient.shutdown();
                 conversationClient = null;
