@@ -1198,9 +1198,14 @@ public class ConversationHandler {
 
     /// Subscribe To Message Update #
     public static void subscribeToMessageUpdate(String conversationId) {
-        // Fire-and-forget (the plugin replies success(null) separately). Bail if
-        // the client isn't ready so we don't NPE on the null conversationClient.
-        if (!isClientInitialized()) {
+        // Guard against the null-client NPE only — NOT the full isClientInitialized()
+        // (which also requires sync COMPLETED). Callers subscribe on room entry
+        // before sync finishes; getConversation/addListener work as soon as the
+        // conversation object is available (independent of full client sync), and
+        // this method is a one-shot with no re-attach. Using the strict guard here
+        // silently dropped the listener and broke receiving new messages (the
+        // pre-guard behaviour attached the listener fine when called early).
+        if (conversationClient == null) {
             return;
         }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
@@ -1573,7 +1578,10 @@ public class ConversationHandler {
 
     /// Unsubscribe To Message Update #
     public static void unSubscribeToMessageUpdate(String conversationId) {
-        if (!isClientInitialized()) {
+        // Null-client guard only (symmetric with subscribeToMessageUpdate); the
+        // strict isClientInitialized() would skip removing the listener while the
+        // client is connected-but-not-yet-synced.
+        if (conversationClient == null) {
             return;
         }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
