@@ -539,29 +539,44 @@ public class ConversationHandler {
     }
 
     /// Join the existing conversation #
-    public static String joinConversation(String conversationId) {
+    // A14: reply from the join callback instead of returning synchronously. The
+    // old version returned conversationId immediately and ignored the async join
+    // outcome (callbacks were empty no-ops, errors swallowed), so the Dart Future
+    // resolved before the join completed — callers then raced ahead to fetch
+    // messages on a not-yet-joined conversation. Now the MethodChannel.Result
+    // fires only when the join succeeds/fails. Single-fire is guaranteed by the
+    // mutually-exclusive callback paths (MainThreadResult also drops any stray
+    // double-call).
+    public static void joinConversation(String conversationId, MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
-            public void onSuccess(Conversation result) {
-                // Retrieve the conversation object using the conversation SID
-                result.join(new StatusListener() {
+            public void onSuccess(Conversation conversation) {
+                conversation.join(new StatusListener() {
                     @Override
                     public void onSuccess() {
+                        result.success(conversationId);
                     }
 
                     @Override
                     public void onError(ErrorInfo errorInfo) {
-                        StatusListener.super.onError(errorInfo);
+                        System.err.println("joinConversation: join failed for "
+                                + conversationId + ": " + errorInfo.getMessage());
+                        result.success(Strings.failed);
                     }
                 });
             }
 
             @Override
             public void onError(ErrorInfo errorInfo) {
-                CallbackListener.super.onError(errorInfo);
+                System.err.println("joinConversation: getConversation failed for "
+                        + conversationId + ": " + errorInfo.getMessage());
+                result.success(Strings.failed);
             }
         });
-        return conversationId;
     }
 
     /// Send message #
