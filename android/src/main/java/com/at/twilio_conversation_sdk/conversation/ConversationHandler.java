@@ -631,6 +631,15 @@ public class ConversationHandler {
     /// Update multiple messages #
     public static void updateMessages(String conversationId, List<HashMap<String, Object>> messages,
             MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            // Reply with a Map (this method's Dart contract is Future<Map>) so a
+            // not-initialized call returns gracefully instead of NPE'ing on the
+            // null conversationClient below.
+            Map<String, Object> notReady = new HashMap<>();
+            notReady.put("error", "Client not initialized");
+            result.success(notReady);
+            return;
+        }
         if (messages == null || messages.isEmpty()) {
             Map<String, Object> responseMap = new HashMap<>();
             responseMap.put("success", new ArrayList<>());
@@ -1189,6 +1198,11 @@ public class ConversationHandler {
 
     /// Subscribe To Message Update #
     public static void subscribeToMessageUpdate(String conversationId) {
+        // Fire-and-forget (the plugin replies success(null) separately). Bail if
+        // the client isn't ready so we don't NPE on the null conversationClient.
+        if (!isClientInitialized()) {
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation result) {
@@ -1529,6 +1543,10 @@ public class ConversationHandler {
     }
 
     public static void setTypingStatus(String conversationId, boolean isTyping, MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
@@ -1555,6 +1573,9 @@ public class ConversationHandler {
 
     /// Unsubscribe To Message Update #
     public static void unSubscribeToMessageUpdate(String conversationId) {
+        if (!isClientInitialized()) {
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation result) {
@@ -1596,6 +1617,9 @@ public class ConversationHandler {
 
     /// Get list of conversations for logged in user #
     public static List<Map<String, Object>> getConversationsList() {
+        if (!isClientInitialized()) {
+            return new ArrayList<>();
+        }
         List<Conversation> conversationList = conversationClient.getMyConversations();
         // System.out.println(conversationList.size()+"");
         List<Map<String, Object>> list = new ArrayList<>();
@@ -2011,6 +2035,10 @@ public class ConversationHandler {
     }
 
     public static void deleteConversation(String conversationId, MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override
             public void onSuccess(Conversation conversation) {
@@ -2471,6 +2499,11 @@ public class ConversationHandler {
 
     public static void updateAccessToken(String accessToken, MethodChannel.Result result) {
         Map<String, Object> tokenStatus = new HashMap<>();
+        if (!isClientInitialized()) {
+            tokenStatus.put("message", "Client not initialized");
+            result.success(tokenStatus);
+            return;
+        }
         conversationClient.updateToken(accessToken, new StatusListener() {
             @Override
             public void onSuccess() {
