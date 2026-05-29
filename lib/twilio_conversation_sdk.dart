@@ -25,6 +25,23 @@ class TwilioConversationSdk {
   static final StreamController<Map> _clientStatusController =
       StreamController<Map>.broadcast();
 
+  // EventChannel → controller bridge subscriptions. Tracked so they can be
+  // cancelled before re-subscribing (D1/D2/D3) and torn down on shutdown (D9).
+  // The broadcast controllers above are `static final` and are deliberately
+  // NOT closed on shutdown — the host app re-initialises the same client in
+  // the same isolate (token refresh / re-login), and adding to a closed
+  // controller would throw. Cancelling the bridge subs stops the stale native
+  // → controller flow without killing the reusable controllers.
+  //
+  // Single active message subscription by design: the host subscribes to one
+  // conversation at a time and cancels/re-subscribes on change, so a single
+  // `_messageBridgeSub` is tracked (not a per-conversation map). Subscribing to
+  // multiple conversations concurrently is not supported — a later subscribe
+  // replaces the bridge of an earlier one.
+  static StreamSubscription<dynamic>? _messageBridgeSub;
+  static StreamSubscription<dynamic>? _tokenBridgeSub;
+  static StreamSubscription<dynamic>? _clientBridgeSub;
+
   /// Stream for receiving incoming messages.
   Stream<Map> get onMessageReceived => _messageUpdateController.stream;
 
@@ -59,11 +76,16 @@ class TwilioConversationSdk {
   /// Returns a [String] indicating the result of the initialization, or `null` if it fails.
   Future<String?> initializeConversationClient(
       {required String accessToken}) async {
-    _clientEventChannel
+    // D2: cancel any prior client bridge before re-subscribing. Without this,
+    // every init (token refresh / re-login) stacked another listener on the
+    // client event channel, all feeding the same controller → duplicate
+    // client-status events that grow with each session.
+    _clientBridgeSub?.cancel();
+    _clientBridgeSub = _clientEventChannel
         .receiveBroadcastStream(accessToken)
         .listen((dynamic clientStatus) {
-      print("Status Listen $clientStatus");
-      _clientStatusController.add(clientStatus);
+      if (clientStatus is! Map) return;
+      _clientStatusController.add(Map<String, dynamic>.from(clientStatus));
     });
     var result = await TwilioConversationSdkPlatform.instance
         .initializeConversationClient(accessToken: accessToken);
@@ -355,10 +377,22 @@ class TwilioConversationSdk {
   }
 
   /// Subscribes to message update events for a specific conversation.
-  void subscribeToMessageUpdate({required String conversationSid}) async {
-    TwilioConversationSdkPlatform.instance
+  ///
+  /// Returns once the native subscription request has been issued. Safe to call
+  /// when switching conversations — the previous message bridge is cancelled
+  /// first so events don't stack across rooms.
+  Future<void> subscribeToMessageUpdate(
+      {required String conversationSid}) async {
+    // D3: await the native subscribe before wiring the event stream, so the
+    // EventChannel sink isn't created before the platform side is ready.
+    await TwilioConversationSdkPlatform.instance
         .subscribeToMessageUpdate(conversationId: conversationSid);
-    _messageEventChannel
+    // D3: cancel the prior message bridge before re-subscribing. Previously
+    // each call stacked another `.listen()` on the event channel that was
+    // never cancelled, so events were re-emitted once per past subscription
+    // (compounding with re-subscribes on every room change / reconnect).
+    _messageBridgeSub?.cancel();
+    _messageBridgeSub = _messageEventChannel
         .receiveBroadcastStream(conversationSid)
         .listen((dynamic message) {
       if (message is! Map) return;
@@ -405,6 +439,10 @@ class TwilioConversationSdk {
   void unSubscribeToMessageUpdate({required String conversationSid}) {
     TwilioConversationSdkPlatform.instance
         .unSubscribeToMessageUpdate(conversationId: conversationSid);
+    // D3: tear down the message bridge so it stops feeding the controller once
+    // the caller has unsubscribed (symmetric with subscribeToMessageUpdate).
+    _messageBridgeSub?.cancel();
+    _messageBridgeSub = null;
   }
 
   /// Updates the access token used for communication.
@@ -415,8 +453,15 @@ class TwilioConversationSdk {
 
   /// Stream for receiving token status changes.
   Stream<Map> get onTokenStatusChange {
-    _tokenEventChannel.receiveBroadcastStream().listen((dynamic tokenStatus) {
-      _tokenStatusController.add(tokenStatus);
+    // D1: subscribe to the token event channel once. This getter used to add a
+    // fresh `.listen()` on every read, stacking duplicate subscriptions that
+    // all fed the same controller. `??=` makes it idempotent; the bridge is
+    // cleared on shutdown so a later read re-subscribes.
+    _tokenBridgeSub ??= _tokenEventChannel
+        .receiveBroadcastStream()
+        .listen((dynamic tokenStatus) {
+      if (tokenStatus is! Map) return;
+      _tokenStatusController.add(Map<String, dynamic>.from(tokenStatus));
     });
     return _tokenStatusController.stream;
   }
@@ -465,6 +510,18 @@ class TwilioConversationSdk {
   /// print(result); // "Client shutdown successfully"
   /// ```
   Future<String?> shutdownClient() {
+    // D9: cancel the EventChannel bridge subscriptions so stale native events
+    // stop reaching the controllers after shutdown. The controllers themselves
+    // are reused across re-init (they're `static final` and the host
+    // re-initialises in the same isolate), so they are intentionally NOT
+    // closed here — only the bridges are torn down. A subsequent init /
+    // subscribe / onTokenStatusChange read re-establishes fresh bridges.
+    _messageBridgeSub?.cancel();
+    _messageBridgeSub = null;
+    _clientBridgeSub?.cancel();
+    _clientBridgeSub = null;
+    _tokenBridgeSub?.cancel();
+    _tokenBridgeSub = null;
     return TwilioConversationSdkPlatform.instance.shutdownClient();
   }
 }
