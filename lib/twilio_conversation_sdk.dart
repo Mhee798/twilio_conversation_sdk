@@ -25,6 +25,13 @@ class TwilioConversationSdk {
   static final StreamController<Map> _clientStatusController =
       StreamController<Map>.broadcast();
 
+  // The message EventChannel must be subscribed exactly once and kept for the
+  // whole session. Re-subscribing per room (a fresh receiveBroadcastStream each
+  // time) churned the native message sink, leaving it null when onMessageAdded
+  // fired so new messages were silently dropped. A single stable subscription
+  // mirrors the client channel (which works).
+  static bool _messageBridgeAttached = false;
+
   /// Stream for receiving incoming messages.
   Stream<Map> get onMessageReceived => _messageUpdateController.stream;
 
@@ -358,8 +365,14 @@ class TwilioConversationSdk {
   void subscribeToMessageUpdate({required String conversationSid}) async {
     TwilioConversationSdkPlatform.instance
         .subscribeToMessageUpdate(conversationId: conversationSid);
+    // Attach the message EventChannel ONCE (the native handler ignores the
+    // argument and just records the sink; per-conversation filtering is done by
+    // the native ConversationListener attached above). Subscribing on every
+    // room entry churned the sink and broke receiving — see _messageBridgeAttached.
+    if (_messageBridgeAttached) return;
+    _messageBridgeAttached = true;
     _messageEventChannel
-        .receiveBroadcastStream(conversationSid)
+        .receiveBroadcastStream()
         .listen((dynamic message) {
       if (message is! Map) return;
       // D5: the native codec delivers Map<Object?, Object?>; normalize to

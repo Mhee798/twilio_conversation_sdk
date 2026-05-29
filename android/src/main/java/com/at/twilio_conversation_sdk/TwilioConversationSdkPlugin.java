@@ -467,6 +467,16 @@ public class TwilioConversationSdkPlugin implements FlutterPlugin, MethodCallHan
         @Override
         public void onListen(Object arguments, EventSink events) {
             eventSink = events;
+            // Claim the static message interface for THIS plugin instance — the
+            // one whose message EventChannel is actually being listened (the
+            // foreground engine). PR #7 moved setListener() to onAttachedToEngine,
+            // so with a second engine present (the FCM background isolate) the
+            // last-attached instance won the static messageInterface while its
+            // eventSink stayed null → triggerEvent routed inbound messages to a
+            // null sink and they were silently dropped. Re-binding here ties
+            // messageInterface to the instance that holds the live eventSink
+            // (matches the pre-#7 behaviour where setListener lived in onListen).
+            new ConversationHandler().setListener(TwilioConversationSdkPlugin.this);
         }
 
         @Override
