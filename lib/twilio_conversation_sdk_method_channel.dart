@@ -17,7 +17,6 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
   }
 
   /// Generate token and authenticate user (only for Android) #
-  @TargetPlatform.android
   @override
   Future<String?> generateToken(
       {required String accountSid,
@@ -26,6 +25,14 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
       required String identity,
       required String serviceSid,
       required String pushSid}) async {
+    // generateToken is implemented on the Android MethodChannel only; iOS
+    // obtains its token from the app backend. The previous `@TargetPlatform.android`
+    // line was a no-op (an enum value, not an annotation) and enforced nothing,
+    // so an iOS call fell through to a bare MissingPluginException. Guard
+    // explicitly with a clear error instead.
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      throw UnsupportedError('generateToken is only supported on Android.');
+    }
     final accessToken =
         await methodChannel.invokeMethod<String>('generateToken', {
       "accountSid": accountSid,
@@ -140,7 +147,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
 
   /// Update multiple messages #
   @override
-  Future<Map?> updateMessages(
+  Future<Map> updateMessages(
       {required String conversationId,
       required List<Map<String, dynamic>> messages}) async {
     final Map? result =
@@ -239,7 +246,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
   }
 
   @override
-  Future<Map?> updateAccessToken({required String accessToken}) async {
+  Future<Map> updateAccessToken({required String accessToken}) async {
     // TODO: implement updateAccessToken
     final Map? result = await methodChannel
         .invokeMethod('updateAccessToken', {"accessToken": accessToken});
@@ -248,7 +255,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
 
   @override
   Future<String?> removeParticipant(
-      {required conversationId, required participantName}) async {
+      {required String conversationId, required String participantName}) async {
     final String? result = await methodChannel.invokeMethod<String>(
         'removeParticipant',
         {"conversationId": conversationId, "participantName": participantName});

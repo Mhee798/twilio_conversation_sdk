@@ -84,7 +84,7 @@ abstract class TwilioConversationSdkPlatform extends PlatformInterface {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
-  Future<Map?> updateMessages({required String conversationId,
+  Future<Map> updateMessages({required String conversationId,
     required List<Map<String, dynamic>> messages}) {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
@@ -128,12 +128,12 @@ abstract class TwilioConversationSdkPlatform extends PlatformInterface {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
-  Future<Map?> updateAccessToken({required String accessToken}) {
+  Future<Map> updateAccessToken({required String accessToken}) {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
   Future<String?> removeParticipant(
-      {required conversationId, required participantName}) {
+      {required String conversationId, required String participantName}) {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 

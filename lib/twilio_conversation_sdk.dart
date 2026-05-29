@@ -37,8 +37,8 @@ class TwilioConversationSdk {
       required String apiKey,
       required String apiSecret,
       required String identity,
-      required serviceSid,
-      required pushSid}) {
+      required String serviceSid,
+      required String pushSid}) {
     return TwilioConversationSdkPlatform.instance.generateToken(
         accountSid: accountSid,
         apiKey: apiKey,
@@ -174,7 +174,9 @@ class TwilioConversationSdk {
   ///
   /// Returns a [String] indicating the result of the operation, or `null` if it fails.
   Future<String?> sendMessage(
-      {required message, required conversationId, required attribute}) {
+      {required String message,
+      required String conversationId,
+      required dynamic attribute}) {
     return TwilioConversationSdkPlatform.instance.sendMessage(
         conversationId: conversationId, message: message, attribute: attribute);
   }
@@ -189,10 +191,10 @@ class TwilioConversationSdk {
   ///
   /// Returns a [String] indicating the result of the operation, or `null` if it fails.
   Future<String?> updateMessage(
-      {required message,
-      required conversationId,
-      required msgId,
-      required attribute}) {
+      {required String message,
+      required String conversationId,
+      required String msgId,
+      required dynamic attribute}) {
     return TwilioConversationSdkPlatform.instance.updateMessage(
         conversationId: conversationId,
         msgId: msgId,
@@ -231,7 +233,7 @@ class TwilioConversationSdk {
   /// - errors: List of error messages for failed updates
   /// - totalSuccess: Total number of successful updates
   /// - totalErrors: Total number of failed updates
-  Future<Map?> updateMessages(
+  Future<Map> updateMessages(
       {required String conversationId,
       required List<Map<String, dynamic>> messages}) {
     return TwilioConversationSdkPlatform.instance.updateMessages(
@@ -247,12 +249,12 @@ class TwilioConversationSdk {
   ///
   /// Returns a [String] indicating the result of the operation, or `null` if it fails.
   Future<String?> sendMessageWithMedia(
-      {required message,
-      required conversationId,
-      required attribute,
-      required mediaFilePath,
-      required mimeType,
-      required fileName}) {
+      {required String message,
+      required String conversationId,
+      required dynamic attribute,
+      required String mediaFilePath,
+      required String mimeType,
+      required String fileName}) {
     return TwilioConversationSdkPlatform.instance.sendMessageWithMedia(
         message: message,
         conversationId: conversationId,
@@ -267,7 +269,7 @@ class TwilioConversationSdk {
   /// - [participantName]: The name of the participant to be added.
   /// - [conversationId]: The ID of the conversation in which to add the participant.
   Future<String?> addParticipant(
-      {required participantName, required conversationId}) {
+      {required String participantName, required String conversationId}) {
     return TwilioConversationSdkPlatform.instance.addParticipant(
         conversationId: conversationId, participantName: participantName);
   }
@@ -277,7 +279,7 @@ class TwilioConversationSdk {
   /// - [participantName]: The name of the participant to be removed.
   /// - [conversationId]: The ID of the conversation from which to remove the participant.
   Future<String?> removeParticipant(
-      {required participantName, required conversationId}) {
+      {required String participantName, required String conversationId}) {
     return TwilioConversationSdkPlatform.instance.removeParticipant(
         conversationId: conversationId, participantName: participantName);
   }
@@ -359,31 +361,27 @@ class TwilioConversationSdk {
     _messageEventChannel
         .receiveBroadcastStream(conversationSid)
         .listen((dynamic message) {
-      if (message != null) {
-        if (message["author"] != null && message["body"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["status"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["mediaStatus"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["messageStatus"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["bytesSent"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["identity"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["typingStatus"] != null) {
-          _messageUpdateController.add(message);
-        }
-        if (message["conversationSid"] != null) {
-          _messageUpdateController.add(message);
-        }
+      if (message is! Map) return;
+      // D5: the native codec delivers Map<Object?, Object?>; normalize to
+      // Map<String, dynamic> once so consumers of onMessageReceived can cast
+      // without a runtime TypeError.
+      final Map<String, dynamic> msg = Map<String, dynamic>.from(message);
+      // D4: forward each recognized event exactly once. These were 8 separate
+      // `if`s with identical bodies, so an event carrying several of these keys
+      // (e.g. a media event has mediaStatus + messageStatus + bytesSent +
+      // conversationSid) was emitted 2-4 times. The map carries all its keys
+      // either way, so emit the complete map a single time.
+      final bool isRecognizedEvent =
+          (msg["author"] != null && msg["body"] != null) ||
+              msg["status"] != null ||
+              msg["mediaStatus"] != null ||
+              msg["messageStatus"] != null ||
+              msg["bytesSent"] != null ||
+              msg["identity"] != null ||
+              msg["typingStatus"] != null ||
+              msg["conversationSid"] != null;
+      if (isRecognizedEvent) {
+        _messageUpdateController.add(msg);
       }
     });
     /*_syncEventChannel
@@ -410,7 +408,7 @@ class TwilioConversationSdk {
   }
 
   /// Updates the access token used for communication.
-  Future<Map?> updateAccessToken({required String accessToken}) {
+  Future<Map> updateAccessToken({required String accessToken}) {
     return TwilioConversationSdkPlatform.instance
         .updateAccessToken(accessToken: accessToken);
   }
