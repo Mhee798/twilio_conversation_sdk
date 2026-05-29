@@ -312,8 +312,9 @@ public class TwilioConversationSdkPlugin implements FlutterPlugin, MethodCallHan
             }
             //Join the existing conversation #
             case Methods.joinConversation:
-                String joinStatus = ConversationHandler.joinConversation(call.argument("conversationId"));
-                result.success(joinStatus);
+                // A14: joinConversation now replies asynchronously from the join
+                // callback — pass the result through instead of completing it here.
+                ConversationHandler.joinConversation(call.argument("conversationId"), result);
                 break;
             // Send message #
             case Methods.sendMessage:
