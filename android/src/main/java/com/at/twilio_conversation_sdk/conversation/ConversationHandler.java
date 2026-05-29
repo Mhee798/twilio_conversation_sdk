@@ -965,6 +965,10 @@ public class ConversationHandler {
     /// Send message #
     public static void sendMessageWithMedia(String enteredMessage, String conversationId, HashMap attribute,
             String mediaFilePath, String mimeType, String fileName, MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         // Fetch the conversation using the conversationId
         // Single-shot reply gate: ensures result.success fires exactly once
         // across every async/sync path below — MediaUploadListener.onFailed,
@@ -2019,6 +2023,10 @@ public class ConversationHandler {
     }
 
     public static void deleteMessage(String conversationId, long index, MethodChannel.Result result) {
+        if (!isClientInitialized()) {
+            result.success("Client not initialized");
+            return;
+        }
         System.err.println("Index - " + index);
         conversationClient.getConversation(conversationId, new CallbackListener<Conversation>() {
             @Override

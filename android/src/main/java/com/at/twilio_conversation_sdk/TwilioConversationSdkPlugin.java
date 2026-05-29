@@ -300,9 +300,16 @@ public class TwilioConversationSdkPlugin implements FlutterPlugin, MethodCallHan
                 //result.success(getLastMessagesList);
                 break;
             // Get messages from the specific conversation #
-            case Methods.getMessages:
-                ConversationHandler.getAllMessages(call.argument("conversationId"), call.argument("messageCount"), result);
+            case Methods.getMessages: {
+                // Dart `int` arrives as Integer for small values, Long for
+                // large ones — coerce via Number to avoid ClassCastException
+                // when getAllMessages' Integer param receives a Long
+                // (matches deleteMessageWithSid below).
+                Number count = call.argument("messageCount");
+                Integer messageCount = (count != null) ? count.intValue() : null;
+                ConversationHandler.getAllMessages(call.argument("conversationId"), messageCount, result);
                 break;
+            }
             //Join the existing conversation #
             case Methods.joinConversation:
                 String joinStatus = ConversationHandler.joinConversation(call.argument("conversationId"));
