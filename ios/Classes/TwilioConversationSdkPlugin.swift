@@ -7,18 +7,21 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
     var conversationsHandler = ConversationsHandler()
     var eventSink: FlutterEventSink?
     var localConversation: TCHConversation?
-    var tokenEventSink: FlutterEventSink?
-    private var conversationsHandlers: ConversationsHandler?
-    
+
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         self.eventSink = events
         self.conversationsHandler.tokenEventSink = events
         return nil
     }
-    
+
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        // I11: clear the sink the handler actually emits through. onListen sets
+        // `conversationsHandler.tokenEventSink`, but the old onCancel cleared an
+        // unused plugin-local `tokenEventSink` (now removed) and left the
+        // handler's sink live after Flutter cancelled the stream → token events
+        // kept hitting a closed sink ("Stream sink was closed" engine crash).
         self.eventSink = nil
-        self.tokenEventSink = nil
+        self.conversationsHandler.tokenEventSink = nil
         return nil
     }
     //  public static func register(with registrar: FlutterPluginRegistrar) {
@@ -75,12 +78,16 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 break
             }
             conversationsHandler.registerFCMToken(token: fcmToken) { success in
-                if success {
-                    result("Token Registerd")
-                } else {
-                    result(FlutterError(code: "FCM_REGISTER_FAILED",
-                                        message: "Failed to register FCM token",
-                                        details: nil))
+                // I12: Twilio invokes this completion on an internal queue;
+                // FlutterResult must be called on the platform thread.
+                DispatchQueue.main.async {
+                    if success {
+                        result("Token Registerd")
+                    } else {
+                        result(FlutterError(code: "FCM_REGISTER_FAILED",
+                                            message: "Failed to register FCM token",
+                                            details: nil))
+                    }
                 }
             }
             break
@@ -90,12 +97,15 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                 break
             }
             conversationsHandler.unregisterFCMToken(token: fcmToken) { success in
-                if success {
-                    result("Token unregisterFCMToken")
-                } else {
-                    result(FlutterError(code: "FCM_UNREGISTER_FAILED",
-                                        message: "Failed to unregister FCM token",
-                                        details: nil))
+                // I12: dispatch the FlutterResult back onto the platform thread.
+                DispatchQueue.main.async {
+                    if success {
+                        result("Token unregisterFCMToken")
+                    } else {
+                        result(FlutterError(code: "FCM_UNREGISTER_FAILED",
+                                            message: "Failed to unregister FCM token",
+                                            details: nil))
+                    }
                 }
             }
             break
@@ -126,14 +136,18 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
             }
             self.conversationsHandler.clientDelegate = self
             self.conversationsHandler.loginWithAccessToken(accessToken) { loginResult in
-                guard let loginResultSuccessful: Bool = loginResult?.isSuccessful else {
-                    result(Strings.authenticationFailed)
-                    return
-                }
-                if(loginResultSuccessful) {
-                    result(Strings.authenticationSuccessful)
-                }else {
-                    result(Strings.authenticationFailed)
+                // I12: the login completion fires from Twilio's client-creation
+                // callback (not guaranteed main); reply on the platform thread.
+                DispatchQueue.main.async {
+                    guard let loginResultSuccessful: Bool = loginResult?.isSuccessful else {
+                        result(Strings.authenticationFailed)
+                        return
+                    }
+                    if(loginResultSuccessful) {
+                        result(Strings.authenticationSuccessful)
+                    } else {
+                        result(Strings.authenticationFailed)
+                    }
                 }
             }
             break
@@ -169,7 +183,9 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                     dictionary["conversationName"] = conversation.friendlyName
                     dictionary["sid"] = conversation.sid
                     dictionary["createdBy"] = conversation.createdBy
-                    dictionary["dateCreated"] = conversation.dateCreated
+                    // I19: send a String, not a raw Date — FlutterStandardCodec
+                    // rejects NSDate ("Unsupported value"). Matches lastMessageDate.
+                    dictionary["dateCreated"] = conversation.dateCreated?.description
                     dictionary["lastReadIndex"] = conversation.lastReadMessageIndex
                     dictionary["lastMessageIndex"] = conversation.lastMessageIndex
                     if (conversation.lastMessageDate != nil){
@@ -199,11 +215,13 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                         participant["identity"] = user.identity
                         participant["sid"] = user.sid
                         participant["conversationSid"] = user.conversation?.sid
-                        participant["dateCreated"] = user.dateCreated
+                        participant["dateCreated"] = user.dateCreated?.description
                         participant["conversationCreatedBy"] = user.conversation?.createdBy
                         participant["isAdmin"] = (user.conversation?.createdBy == user.identity)
                         do {
-                            let jsonData = try JSONSerialization.data(withJSONObject: user.attributes()!.dictionary ?? Dictionary(), options: .prettyPrinted)
+                            // I20: avoid force-unwrap — a participant may have no
+                            // attributes (matches getParticipantsWithName below).
+                            let jsonData = try JSONSerialization.data(withJSONObject: user.attributes()?.dictionary ?? [:], options: .prettyPrinted)
                             if let jsonString = String(data: jsonData, encoding: .utf8) {
                                 print(jsonString)
                                 participant["attributes"] = jsonString
@@ -241,7 +259,7 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
                         participant["identity"] = user.identity
                         participant["sid"] = user.sid
                         participant["conversationSid"] = user.conversation?.sid
-                        participant["dateCreated"] = user.dateCreated
+                        participant["dateCreated"] = user.dateCreated?.description
                         participant["conversationCreatedBy"] = user.conversation?.createdBy
                         participant["isAdmin"] = (user.conversation?.createdBy == user.identity)
                         // Handle attributes serialization

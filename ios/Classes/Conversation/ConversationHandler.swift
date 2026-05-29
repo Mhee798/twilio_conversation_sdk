@@ -403,7 +403,12 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         typingMap["identity"] = participant.identity ?? ""
         typingMap["conversationSid"] = conversation.sid ?? ""
 
-        self.messageDelegate?.onMessageUpdate(message: typingMap, messageSubscriptionId: self.messageSubscriptionId)
+        // I12: typing delegate callbacks fire on Twilio's queue; emit the event
+        // on the platform thread (matches synchronizationStatusUpdated).
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.messageDelegate?.onMessageUpdate(message: typingMap, messageSubscriptionId: self.messageSubscriptionId)
+        }
     }
 
     // MARK: - Typing Ended Listener
@@ -421,7 +426,12 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         typingMap["identity"] = participant.identity ?? ""
         typingMap["conversationSid"] = conversation.sid ?? ""
 
-        self.messageDelegate?.onMessageUpdate(message: typingMap, messageSubscriptionId: self.messageSubscriptionId)
+        // I12: typing delegate callbacks fire on Twilio's queue; emit the event
+        // on the platform thread (matches synchronizationStatusUpdated).
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.messageDelegate?.onMessageUpdate(message: typingMap, messageSubscriptionId: self.messageSubscriptionId)
+        }
     }
 
     func registerFCMToken(token: String,completion: @escaping (_ success : Bool) -> Void){
@@ -483,7 +493,11 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         var tokenStatusMap: [String: Any] = [:]
         tokenStatusMap["statusCode"] = 200
         tokenStatusMap["message"] = Strings.accessTokenWillExpire
-        tokenEventSink?(tokenStatusMap)
+        // I12: token delegate callbacks fire on Twilio's internal queue; emit
+        // on the platform thread so the EventChannel sink is touched on main.
+        DispatchQueue.main.async { [weak self] in
+            self?.tokenEventSink?(tokenStatusMap)
+        }
     }
 
 
@@ -517,7 +531,11 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         var tokenStatusMap: [String: Any] = [:]
         tokenStatusMap["statusCode"] = 401
         tokenStatusMap["message"] = Strings.accessTokenExpired
-        tokenEventSink?(tokenStatusMap)
+        // I12: token delegate callbacks fire on Twilio's internal queue; emit
+        // on the platform thread so the EventChannel sink is touched on main.
+        DispatchQueue.main.async { [weak self] in
+            self?.tokenEventSink?(tokenStatusMap)
+        }
     }
 
     public func updateAccessToken(accessToken:String,completion: @escaping (TCHResult?) -> Void) {
@@ -965,20 +983,18 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
         // Set up Twilio Conversations client
         TwilioConversationsClient.conversationsClient(withToken: token,
                                                       properties: nil,
-                                                      delegate: self) { (result, client) in
+                                                      delegate: self) { [weak self] (result, client) in
+            // I13: capture self weakly so this escaping completion doesn't keep
+            // the handler alive. Twilio also retains `self` as the client
+            // delegate; that edge is broken in shutdownClient (client.delegate = nil).
+            guard let self = self else {
+                completion(result)
+                return
+            }
             self.client = client
             self.clientDelegate?.onClientSynchronizationChanged(status: ["status" : client?.synchronizationStatus.rawValue ?? -1])
             print("\(client?.synchronizationStatus.rawValue ?? -1)")
-            //            self.client?.delegate?.conversationsClient?(<#T##client: TwilioConversationsClient##TwilioConversationsClient#>, synchronizationStatusUpdated: TCHClientSynchronizationStatus)
             completion(result)
-        }
-    }
-
-    func shutdown() {
-        if let client = client {
-            client.delegate = nil
-            client.shutdown()
-            self.client = nil
         }
     }
 
@@ -1642,6 +1658,9 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
         if let client = self.client {
             // Shutdown the client
+            // I13: explicitly break the Twilio client → handler (delegate)
+            // retain edge before teardown (Twilio holds `delegate: self`).
+            client.delegate = nil
             client.shutdown()
             self.client = nil
 
