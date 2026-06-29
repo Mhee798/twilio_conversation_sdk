@@ -3,26 +3,45 @@ import UIKit
 import Foundation
 import TwilioConversationsClient
 
-public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamHandler  {
-    var conversationsHandler = ConversationsHandler()
-    var eventSink: FlutterEventSink?
-    var localConversation: TCHConversation?
-
+// Per-channel stream handler so each EventChannel keeps its OWN sink. iOS
+// previously made the plugin the single StreamHandler for ALL channels with one
+// shared `eventSink`; whichever channel's onListen fired last won the sink, so
+// live message events were delivered to the client-sync stream and the message
+// listener never received them (receiving appeared dead on iOS). Mirrors the
+// Android "A11" per-channel-sink fix.
+class ChannelStreamHandler: NSObject, FlutterStreamHandler {
+    private let onSink: (FlutterEventSink?) -> Void
+    init(_ onSink: @escaping (FlutterEventSink?) -> Void) { self.onSink = onSink }
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
-        self.eventSink = events
-        self.conversationsHandler.tokenEventSink = events
+        onSink(events)
         return nil
     }
-
     public func onCancel(withArguments arguments: Any?) -> FlutterError? {
-        // I11: clear the sink the handler actually emits through. onListen sets
-        // `conversationsHandler.tokenEventSink`, but the old onCancel cleared an
-        // unused plugin-local `tokenEventSink` (now removed) and left the
-        // handler's sink live after Flutter cancelled the stream → token events
-        // kept hitting a closed sink ("Stream sink was closed" engine crash).
-        self.eventSink = nil
-        self.conversationsHandler.tokenEventSink = nil
+        onSink(nil)
         return nil
+    }
+}
+
+public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin {
+    var conversationsHandler = ConversationsHandler()
+    // Separate sink per channel (no more shared eventSink across channels).
+    var messageEventSink: FlutterEventSink?
+    var clientEventSink: FlutterEventSink?
+    var syncEventSink: FlutterEventSink?
+    var localConversation: TCHConversation?
+
+    // Twilio delegate callbacks arrive on Twilio's own queues, but a
+    // FlutterEventSink MUST be invoked on the platform (main) thread. Marshal
+    // every emit onto main; this also serializes sink reads against onListen/
+    // onCancel (which Flutter calls on main), so the plain sink fields are never
+    // touched concurrently. Mirrors Android's postToMainOrLog + volatile sinks.
+    private func emitMain(_ emit: @escaping () -> Void) {
+        // Always hop async to main (never run inline). Besides satisfying
+        // Flutter's platform-thread requirement, this preserves arrival order:
+        // an event delivered on a Twilio queue is async-queued, so an event that
+        // happens to arrive already on main must NOT run inline and overtake an
+        // earlier emit still sitting in the main queue on the same sink.
+        DispatchQueue.main.async(execute: emit)
     }
     //  public static func register(with registrar: FlutterPluginRegistrar) {
     //    let channel = FlutterMethodChannel(name: "twilio_conversation_sdk", binaryMessenger: registrar.messenger())
@@ -39,10 +58,16 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
         
         let instance = TwilioConversationSdkPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
-        messageEventChannel.setStreamHandler(instance)
-        synchronizationStatusEventChannel.setStreamHandler(instance)
-        tokenEventChannel.setStreamHandler(instance)
-        onClientSynchronizationChangedEventChannel.setStreamHandler(instance)
+
+        // Each channel routes to its OWN sink so events never cross-route. The
+        // channels (held by the binary messenger) retain these handlers, and the
+        // handlers retain `instance` strongly — keeping it alive as long as any
+        // channel can deliver. No retain cycle: conversationsHandler references
+        // the plugin only through weak message/client delegates.
+        messageEventChannel.setStreamHandler(ChannelStreamHandler { instance.messageEventSink = $0 })
+        onClientSynchronizationChangedEventChannel.setStreamHandler(ChannelStreamHandler { instance.clientEventSink = $0 })
+        tokenEventChannel.setStreamHandler(ChannelStreamHandler { instance.conversationsHandler.tokenEventSink = $0 })
+        synchronizationStatusEventChannel.setStreamHandler(ChannelStreamHandler { instance.syncEventSink = $0 })
     }
     
     //  public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -604,7 +629,15 @@ public class TwilioConversationSdkPlugin: NSObject, FlutterPlugin,FlutterStreamH
 
 extension TwilioConversationSdkPlugin : MessageDelegate {
     func onSynchronizationChanged(status: [String : Any]) {
-        self.eventSink?(status)
+        // Conversation-sync status. The Dart side currently reads it off the
+        // MESSAGE stream (the dedicated sync-channel listener in
+        // twilio_conversation_sdk.dart is commented out), so we publish to both
+        // for Android parity. NOTE: if that sync-channel listener is re-enabled,
+        // drop the messageEventSink emit below or status is delivered twice.
+        emitMain { [weak self] in
+            self?.messageEventSink?(status)
+            self?.syncEventSink?(status)
+        }
     }
 
     func onMessageUpdate(message: [String : Any], messageSubscriptionId: String) {
@@ -612,7 +645,7 @@ extension TwilioConversationSdkPlugin : MessageDelegate {
         if let typingStatus = message["typingStatus"], let conversationSid = message["conversationSid"] as? String {
             if (messageSubscriptionId == conversationSid) {
                 print("📤 Forwarding typing event to Flutter: \(message)")
-                self.eventSink?(message)
+                emitMain { [weak self] in self?.messageEventSink?(message) }
             } else {
                 print("⚠️ Typing event conversationSid mismatch: subscribed=\(messageSubscriptionId), received=\(conversationSid)")
             }
@@ -623,7 +656,7 @@ extension TwilioConversationSdkPlugin : MessageDelegate {
         if let conversationId = message["conversationId"] as? String, let messageData = message["message"] as? [String:Any] {
             if (messageSubscriptionId == conversationId) {
                 print("📤 Forwarding message event to Flutter: \(messageData)")
-                self.eventSink?(messageData)
+                emitMain { [weak self] in self?.messageEventSink?(messageData) }
             } else {
                 print("⚠️ Message event conversationId mismatch: subscribed=\(messageSubscriptionId), received=\(conversationId)")
             }
@@ -637,7 +670,7 @@ extension TwilioConversationSdkPlugin : MessageDelegate {
 extension TwilioConversationSdkPlugin : ClientDelegate {
     func onClientSynchronizationChanged(status: [String : Any]) {
         print("--------Status-------------> " + "\(status)")
-        self.eventSink?(status)
+        emitMain { [weak self] in self?.clientEventSink?(status) }
     }
 }
 
