@@ -1668,7 +1668,10 @@ public class ConversationHandler {
 
     public static void getLastMessages(String conversationId, MethodChannel.Result result) {
         if (!isClientInitialized()) {
-            result.success("Client not initialized");
+            // F8: Dart types this getter as Future<List?> and casts the reply
+            // to List — returning a String here throws a Dart TypeError.
+            // Return an empty list (matches getConversationsList + iOS).
+            result.success(new ArrayList<>());
             return;
         }
 
@@ -1801,7 +1804,8 @@ public class ConversationHandler {
 
     public static void getUnReadMsgCount(String conversationId, MethodChannel.Result result) {
         if (!isClientInitialized()) {
-            result.success("Client not initialized");
+            // F8: Dart casts this reply to List<?> — return empty list, not String.
+            result.success(new ArrayList<>());
             return;
         }
 
@@ -1850,7 +1854,8 @@ public class ConversationHandler {
     /// Get messages from the specific conversation #
     public static void getAllMessages(String conversationId, Integer messageCount, MethodChannel.Result result) {
         if (!isClientInitialized()) {
-            result.success("Client not initialized");
+            // F8: Dart casts this reply to List<?> — return empty list, not String.
+            result.success(new ArrayList<>());
             return;
         }
 
@@ -2407,7 +2412,8 @@ public class ConversationHandler {
     /// Get participants from the specific conversation #
     public static void getParticipants(String conversationId, MethodChannel.Result result) {
         if (!isClientInitialized()) {
-            result.success("Client not initialized");
+            // F8: Dart casts this reply to List<?> — return empty list, not String.
+            result.success(new ArrayList<>());
             return;
         }
 
@@ -2445,7 +2451,8 @@ public class ConversationHandler {
 
     public static void getParticipantsWithName(String conversationId, MethodChannel.Result result) {
         if (!isClientInitialized()) {
-            result.success("Client not initialized");
+            // F8: Dart casts this reply to List<?> — return empty list, not String.
+            result.success(new ArrayList<>());
             return;
         }
 
@@ -2453,7 +2460,12 @@ public class ConversationHandler {
             @Override
             public void onSuccess(Conversation conversation) {
                 List<Participant> participantList = conversation.getParticipantsList();
-                List<Map<String, Object>> participants = new ArrayList<>();
+                // A25: getAndSubscribeUser's callbacks fire on Twilio worker
+                // threads, so participants.add(...) runs concurrently — a plain
+                // ArrayList can drop entries or corrupt under the racing adds
+                // (same hazard A9/A20 fixed in the sibling getters). The
+                // AtomicInteger only orders the count, not the list mutation.
+                List<Map<String, Object>> participants = Collections.synchronizedList(new ArrayList<>());
                 AtomicInteger pendingCallbacks = new AtomicInteger(participantList.size());
 
                 if (participantList.isEmpty()) {
