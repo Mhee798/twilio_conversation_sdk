@@ -183,7 +183,7 @@ class TwilioConversationSdk {
   Future<String?> sendMessage(
       {required String message,
       required String conversationId,
-      required dynamic attribute}) {
+      required Map<String, dynamic>? attribute}) {
     return TwilioConversationSdkPlatform.instance.sendMessage(
         conversationId: conversationId, message: message, attribute: attribute);
   }
@@ -201,7 +201,7 @@ class TwilioConversationSdk {
       {required String message,
       required String conversationId,
       required String msgId,
-      required dynamic attribute}) {
+      required Map<String, dynamic>? attribute}) {
     return TwilioConversationSdkPlatform.instance.updateMessage(
         conversationId: conversationId,
         msgId: msgId,
@@ -258,7 +258,7 @@ class TwilioConversationSdk {
   Future<String?> sendMessageWithMedia(
       {required String message,
       required String conversationId,
-      required dynamic attribute,
+      required Map<String, dynamic>? attribute,
       required String mediaFilePath,
       required String mimeType,
       required String fileName}) {

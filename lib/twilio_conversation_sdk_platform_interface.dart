@@ -73,14 +73,14 @@ abstract class TwilioConversationSdkPlatform extends PlatformInterface {
 
   Future<String?> sendMessage({required String conversationId,
     required String message,
-    required dynamic attribute}) {
+    required Map<String, dynamic>? attribute}) {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
   Future<String?> updateMessage({required String conversationId,
     required String msgId,
     required String message,
-    required dynamic attribute}) {
+    required Map<String, dynamic>? attribute}) {
     throw UnimplementedError('platformVersion() has not been implemented.');
   }
 
@@ -92,7 +92,7 @@ abstract class TwilioConversationSdkPlatform extends PlatformInterface {
   Future<String?> sendMessageWithMedia({
     required String message,
     required String conversationId,
-    required dynamic attribute,
+    required Map<String, dynamic>? attribute,
     required String mediaFilePath,
     required String mimeType,
     required String fileName}) {
