@@ -1099,14 +1099,17 @@ class ConversationsHandler: NSObject, TwilioConversationsClientDelegate {
 
 
     func joinConversation(_ conversation: TCHConversation,_ completion: @escaping(String?) -> Void) {
+        // I12: conversation.join's callback fires on a Twilio delegate
+        // (off-main) thread, so its `completion` — and the FlutterResult it
+        // drives at the call site — would run off-main, violating the
+        // platform-channel contract. Deliver every path on main, always
+        // async, matching the rest of this file (and emitMain in the plugin).
         if conversation.status == .joined {
-            completion(conversation.sid)
+            DispatchQueue.main.async { completion(conversation.sid) }
         } else {
             conversation.join(completion: { result in
-                if result.isSuccessful {
-                    completion(conversation.sid)
-                } else {
-                    completion(nil)
+                DispatchQueue.main.async {
+                    completion(result.isSuccessful ? conversation.sid : nil)
                 }
             })
         }
