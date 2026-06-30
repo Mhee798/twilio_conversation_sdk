@@ -118,7 +118,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
   Future<String?> sendMessage(
       {required String conversationId,
       required String message,
-      dynamic attribute}) async {
+      Map<String, dynamic>? attribute}) async {
     final String? result = await methodChannel.invokeMethod<String>(
         'sendMessage', {
       "conversationId": conversationId,
@@ -134,7 +134,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
       {required String conversationId,
       required String msgId,
       required String message,
-      dynamic attribute}) async {
+      Map<String, dynamic>? attribute}) async {
     final String? result =
         await methodChannel.invokeMethod<String>('updateMessage', {
       "conversationId": conversationId,
@@ -163,7 +163,7 @@ class MethodChannelTwilioConversationSdk extends TwilioConversationSdkPlatform {
   Future<String?> sendMessageWithMedia(
       {required String message,
       required String conversationId,
-      dynamic attribute,
+      Map<String, dynamic>? attribute,
       required String mediaFilePath,
       required String mimeType,
       required String fileName}) async {

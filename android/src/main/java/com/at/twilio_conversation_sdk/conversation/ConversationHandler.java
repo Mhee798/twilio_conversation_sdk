@@ -711,7 +711,7 @@ public class ConversationHandler {
                                                             (HashMap<String, Object>) newAttributeObj);
                                                     finalAttributes = new Attributes(jsonObject);
                                                 } catch (Exception e) {
-                                                    System.err.println("Error creating attributes: " + e.getMessage());
+                                                    System.err.println("Error creating attributes: " + e);
                                                 }
                                             }
 
@@ -1161,7 +1161,7 @@ public class ConversationHandler {
                             });
                 } catch (Exception e) {
                     // Handle exceptions (e.g., JSONException, FileNotFoundException)
-                    System.err.println("Error preparing message: " + e.getMessage());
+                    System.err.println("Error preparing message: " + e);
                     // A16: only close the stream if Twilio has NOT yet taken
                     // ownership via addMedia — once addMedia has returned, the
                     // SDK may still be reading from the stream on a worker
@@ -1354,7 +1354,7 @@ public class ConversationHandler {
                                     });
 
                         } catch (Exception e) {
-                            System.err.println("Exception: " + e.getMessage());
+                            System.err.println("Exception: " + e);
                             HashMap<String, Object> progressData = new HashMap<>();
                             progressData.put("messageStatus", Strings.failed);
                             triggerEvent(progressData);
@@ -1455,7 +1455,7 @@ public class ConversationHandler {
                                     });
 
                         } catch (Exception e) {
-                            System.err.println("Exception: " + e.getMessage());
+                            System.err.println("Exception: " + e);
                             HashMap<String, Object> progressData = new HashMap<>();
                             progressData.put("messageStatus", Strings.failed);
                             triggerEvent(progressData);
